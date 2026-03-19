@@ -4,6 +4,10 @@ use std::io::Write;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub mod benchmark_proto {
+    tonic::include_proto!("benchmark");
+}
+
 use rand::Rng;
 
 use bytes::Bytes;
@@ -34,6 +38,7 @@ enum Role {
 enum BrokerType {
     Redpanda,
     Nats,
+    Grpc,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -72,6 +77,7 @@ fn parse_config() -> Config {
 
     let broker_type = match env_var("BROKER_TYPE", "nats").to_lowercase().as_str() {
         "redpanda" => BrokerType::Redpanda,
+        "grpc" => BrokerType::Grpc,
         _ => BrokerType::Nats,
     };
 
@@ -80,6 +86,7 @@ fn parse_config() -> Config {
         match broker_type {
             BrokerType::Redpanda => "localhost:9092",
             BrokerType::Nats => "localhost:4222",
+            BrokerType::Grpc => "0.0.0.0:50051",
         },
     );
 
@@ -363,6 +370,7 @@ fn broker_type_str(bt: &BrokerType) -> &'static str {
     match bt {
         BrokerType::Redpanda => "redpanda",
         BrokerType::Nats => "nats",
+        BrokerType::Grpc => "grpc",
     }
 }
 
@@ -764,10 +772,10 @@ fn emit_consumer_csv(
 
     write_csv_header(&mut f);
 
-    // NATS uses 1 stream per size; Redpanda uses num_partitions topics
+    // NATS uses 1 stream per size; Redpanda and gRPC use num_partitions topics
     let partition_count = match cfg.broker_type {
         BrokerType::Nats => 1,
-        BrokerType::Redpanda => cfg.num_partitions,
+        BrokerType::Redpanda | BrokerType::Grpc => cfg.num_partitions,
     };
 
     for (size_bytes, size_label, _) in streams {
@@ -827,6 +835,215 @@ fn emit_producer_csv(
     }
 }
 
+// ─── gRPC implementation ──────────────────────────────────────────────────────
+
+async fn grpc_consumer(cfg: Config) {
+    use benchmark_proto::benchmark_service_server::{BenchmarkService, BenchmarkServiceServer};
+    use benchmark_proto::{BenchmarkMessage, StreamSummary};
+    use std::sync::Mutex;
+    use tokio_stream::StreamExt;
+    use tonic::{transport::Server, Request, Response, Status, Streaming};
+
+    eprintln!(
+        "[consumer] starting gRPC server on {}",
+        cfg.broker_endpoint
+    );
+
+    let streams = active_streams(&cfg.run_mode);
+
+    // Shared stats map keyed by stream_id (size_bytes * 1000 + partition).
+    let stats: Arc<Mutex<HashMap<u64, StreamStats>>> = Arc::new(Mutex::new(HashMap::new()));
+
+    struct Svc {
+        stats: Arc<Mutex<HashMap<u64, StreamStats>>>,
+    }
+
+    #[tonic::async_trait]
+    impl BenchmarkService for Svc {
+        async fn stream_messages(
+            &self,
+            request: Request<Streaming<BenchmarkMessage>>,
+        ) -> Result<Response<StreamSummary>, Status> {
+            let mut stream = request.into_inner();
+            let mut count: u64 = 0;
+            while let Some(msg) = StreamExt::next(&mut stream).await {
+                match msg {
+                    Ok(m) => {
+                        let recv_ns = now_ns();
+                        let payload = m.payload;
+                        if let Some((_, _, stream_id)) = decode_header(&payload) {
+                            let mut map = self.stats.lock().unwrap();
+                            map.entry(stream_id)
+                                .or_insert_with(StreamStats::new)
+                                .record(&payload, recv_ns);
+                        }
+                        count += 1;
+                    }
+                    Err(e) => eprintln!("[consumer] stream error: {}", e),
+                }
+            }
+            Ok(Response::new(StreamSummary {
+                messages_received: count,
+            }))
+        }
+    }
+
+    let svc = Svc {
+        stats: stats.clone(),
+    };
+
+    let addr = cfg.broker_endpoint.parse().expect("invalid gRPC listen address");
+
+    // Shut down after run_duration + producer_start_delay + 10s buffer.
+    let shutdown_after =
+        Duration::from_secs(cfg.run_duration_secs + cfg.producer_start_delay_secs + 10);
+
+    Server::builder()
+        .add_service(
+            BenchmarkServiceServer::new(svc)
+                .max_decoding_message_size(64 * 1024 * 1024),
+        )
+        .serve_with_shutdown(addr, async move {
+            tokio::time::sleep(shutdown_after).await;
+        })
+        .await
+        .expect("gRPC server error");
+
+    // Reconstruct stats_map keyed by topic name for emit_consumer_csv().
+    let raw = stats.lock().unwrap();
+    let mut stats_map: HashMap<String, StreamStats> = HashMap::new();
+    for (size_bytes, size_label, _) in &streams {
+        for p in 0..cfg.num_partitions {
+            let stream_id = size_bytes * 1000 + p as u64;
+            if let Some(s) = raw.get(&stream_id) {
+                let topic = topic_name(&cfg.topic_prefix, size_label, p as u64);
+                let mut agg = StreamStats::new();
+                agg.merge(s);
+                stats_map.insert(topic, agg);
+            }
+        }
+    }
+    drop(raw);
+
+    emit_consumer_csv(&cfg, &stats_map, &streams);
+}
+
+async fn grpc_producer(cfg: Config) {
+    use benchmark_proto::benchmark_service_client::BenchmarkServiceClient;
+    use benchmark_proto::BenchmarkMessage;
+    use tokio::sync::mpsc;
+    use tokio_stream::wrappers::ReceiverStream;
+
+    sleep(Duration::from_secs(cfg.producer_start_delay_secs)).await;
+
+    let endpoint = format!("http://{}", cfg.broker_endpoint);
+    eprintln!("[producer] connecting to gRPC server at {}", endpoint);
+
+    // Single channel with HTTP/2 multiplexing — one connection, many concurrent streams.
+    let channel = tonic::transport::Channel::from_shared(endpoint)
+        .expect("invalid gRPC endpoint")
+        .connect()
+        .await
+        .expect("gRPC connect failed");
+
+    let streams = active_streams(&cfg.run_mode);
+    let bytes_per_sec = cfg.gbps_target * 1_000_000_000.0 / 8.0;
+    let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
+
+    let mut handles: Vec<(u64, &'static str, tokio::task::JoinHandle<u64>)> = Vec::new();
+
+    for (size_bytes, size_label, fraction) in &streams {
+        let msgs_per_sec =
+            (bytes_per_sec * fraction) / (*size_bytes as f64 * cfg.num_partitions as f64);
+        let rate = compute_rate_params(msgs_per_sec);
+        let base_stream_id = *size_bytes;
+
+        eprintln!(
+            "[producer] gRPC {} x{} partitions -> {:.1} msg/s/partition (batch={}, interval={}ms)",
+            size_label, cfg.num_partitions, msgs_per_sec, rate.batch_size, rate.interval_ms
+        );
+
+        for p in 0..cfg.num_partitions {
+            let stream_id = base_stream_id * 1000 + p as u64;
+            let channel2 = channel.clone();
+            let size_bytes = *size_bytes;
+            let size_label = *size_label;
+
+            let handle = tokio::spawn(async move {
+                let mut client = BenchmarkServiceClient::new(channel2)
+                    .max_encoding_message_size(64 * 1024 * 1024);
+
+                // mpsc channel bridges rate-limited sends into the gRPC streaming RPC.
+                let (tx, rx) = mpsc::channel::<BenchmarkMessage>(256);
+                let stream = ReceiverStream::new(rx);
+
+                // Spawn the RPC call — it runs until the sender is dropped.
+                let rpc = tokio::spawn(async move {
+                    match client.stream_messages(stream).await {
+                        Ok(_) => {}
+                        Err(e) => eprintln!("[producer] gRPC RPC error partition {}: {}", p, e),
+                    }
+                });
+
+                let mut buf = vec![0u8; size_bytes as usize];
+                { let mut rng = rand::thread_rng(); rng.fill(&mut buf[HEADER_LEN..]); }
+                let mut seq: u64 = 0;
+                let mut ticker = interval(Duration::from_millis(rate.interval_ms));
+
+                loop {
+                    if Instant::now() >= run_deadline {
+                        break;
+                    }
+                    ticker.tick().await;
+
+                    for _ in 0..rate.batch_size {
+                        if Instant::now() >= run_deadline {
+                            break;
+                        }
+                        let ts = now_ns();
+                        encode_message(&mut buf, ts, seq, stream_id);
+                        let msg = BenchmarkMessage {
+                            payload: buf.clone(),
+                        };
+                        if tx.send(msg).await.is_err() {
+                            break;
+                        }
+                        seq += 1;
+                    }
+                }
+
+                drop(tx); // close stream → server returns StreamSummary
+                let _ = rpc.await;
+                eprintln!(
+                    "[producer] gRPC {}/partition-{} done, sent {} messages",
+                    size_label, p, seq
+                );
+                seq
+            });
+            handles.push((size_bytes, size_label, handle));
+        }
+    }
+
+    let mut sent_map: HashMap<(u64, &'static str), u64> = HashMap::new();
+    for (size_bytes, size_label, h) in handles {
+        let sent = h.await.unwrap_or(0);
+        *sent_map.entry((size_bytes, size_label)).or_insert(0) += sent;
+    }
+    let sent_per_stream: Vec<(u64, &'static str, u64)> = streams
+        .iter()
+        .map(|(size, label, _)| {
+            (
+                *size,
+                *label,
+                sent_map.get(&(*size, *label)).copied().unwrap_or(0),
+            )
+        })
+        .collect();
+
+    eprintln!("[producer] all gRPC streams complete");
+    emit_producer_csv(&cfg, &sent_per_stream);
+}
+
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -848,6 +1065,8 @@ async fn main() {
         (Role::Consumer, BrokerType::Nats) => nats_consumer(cfg).await,
         (Role::Producer, BrokerType::Redpanda) => redpanda_producer(cfg).await,
         (Role::Consumer, BrokerType::Redpanda) => redpanda_consumer(cfg).await,
+        (Role::Producer, BrokerType::Grpc) => grpc_producer(cfg).await,
+        (Role::Consumer, BrokerType::Grpc) => grpc_consumer(cfg).await,
     }
 }
 

@@ -1,0 +1,17 @@
+syntax = "proto3";
+package benchmark;
+
+// Same 24-byte header + padded body used by all transports.
+message BenchmarkMessage {
+  bytes payload = 1;
+}
+
+// Returned once when the producer closes the stream.
+message StreamSummary {
+  uint64 messages_received = 1;
+}
+
+service BenchmarkService {
+  // One RPC per logical stream. Producer streams messages; consumer tallies stats.
+  rpc StreamMessages(stream BenchmarkMessage) returns (StreamSummary);
+}

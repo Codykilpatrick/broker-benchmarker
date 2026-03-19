@@ -1,0 +1,45 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchmark-producer
+  labels:
+    app: benchmark-producer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: benchmark-producer
+  template:
+    metadata:
+      labels:
+        app: benchmark-producer
+    spec:
+      containers:
+      - name: producer
+        image: <registry>/broker-benchmarker:latest
+        imagePullPolicy: Always
+        env:
+        - name: ROLE
+          value: "producer"
+        - name: BROKER_TYPE
+          value: "redpanda"          # or "nats"
+        - name: BROKER_ENDPOINT
+          value: "redpanda.default.svc.cluster.local:9092"
+        - name: GBPS_TARGET
+          value: "5"
+        - name: RUN_MODE
+          value: "combined"          # combined | 1kb | 64kb | 1mb | 32mb
+        - name: TOPIC_PREFIX
+          value: "benchmark"
+        - name: RUN_DURATION_SECS
+          value: "120"
+        - name: PRODUCER_START_DELAY_SECS
+          value: "10"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+      restartPolicy: Always

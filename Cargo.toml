@@ -1,0 +1,17 @@
+[package]
+name = "broker-benchmarker"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "broker-benchmarker"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rdkafka = { version = "0.36", features = ["cmake-build"] }
+async-nats = "0.38"
+hdrhistogram = "7"
+futures = "0.3"
+bytes = "1"
+rand = "0.8"

@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: benchmark-consumer
+  labels:
+    app: benchmark-consumer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: benchmark-consumer
+  template:
+    metadata:
+      labels:
+        app: benchmark-consumer
+    spec:
+      containers:
+      - name: consumer
+        image: <registry>/broker-benchmarker:latest
+        imagePullPolicy: Always
+        env:
+        - name: ROLE
+          value: "consumer"
+        - name: BROKER_TYPE
+          value: "redpanda"          # or "nats"
+        - name: BROKER_ENDPOINT
+          value: "redpanda.default.svc.cluster.local:9092"
+        - name: GBPS_TARGET
+          value: "5"
+        - name: RUN_MODE
+          value: "combined"          # combined | 1kb | 64kb | 1mb | 32mb
+        - name: TOPIC_PREFIX
+          value: "benchmark"
+        - name: RUN_DURATION_SECS
+          value: "120"
+        resources:
+          requests:
+            cpu: "2"
+            memory: "4Gi"
+          limits:
+            cpu: "4"
+            memory: "8Gi"
+      restartPolicy: Always

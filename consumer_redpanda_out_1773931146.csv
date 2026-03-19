@@ -1,0 +1,4 @@
+role,broker_type,run_mode,gbps_target,message_size_bytes,run_duration_secs,messages_sent,messages_received,messages_lost,achieved_throughput_gbps,latency_p50_ms,latency_p95_ms,latency_p99_ms,latency_max_ms
+consumer,redpanda,combined,10.000,65536,60,,154597,0,1.350889,115.947,378.351,1207.423,3418.751
+consumer,redpanda,combined,10.000,1048576,60,,11030,0,1.542106,119.659,342.591,752.415,2279.295
+consumer,redpanda,combined,10.000,33554432,60,,521,0,2.330915,277.311,1943.359,2891.775,3701.247

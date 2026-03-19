@@ -1,0 +1,1 @@
+Result<Result<(i32, i64), (KafkaError, OwnedMessage)>, futures::futures_channel::oneshot::Canceled>

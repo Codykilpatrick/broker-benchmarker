@@ -1,0 +1,13 @@
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/cmake/RdKafka/RdKafkaConfig.cmake
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/cmake/RdKafka/RdKafkaConfigVersion.cmake
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/cmake/RdKafka/FindLZ4.cmake
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/cmake/RdKafka/RdKafkaTargets.cmake
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/cmake/RdKafka/RdKafkaTargets-debug.cmake
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/share/licenses/librdkafka/LICENSES.txt
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/pkgconfig/rdkafka-static.pc
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/librdkafka.a
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/include/librdkafka/rdkafka.h
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/include/librdkafka/rdkafka_mock.h
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/pkgconfig/rdkafka++-static.pc
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/lib/librdkafka++.a
+/Users/codykilpatrick/Documents/GitHub/broker-benchmarker/target/debug/build/rdkafka-sys-b3f966de0d47492e/out/include/librdkafka/rdkafkacpp.h

@@ -37,6 +37,7 @@ enum Role {
 #[derive(Debug, Clone, PartialEq)]
 enum BrokerType {
     Redpanda,
+    Kafka,
     Nats,
     Grpc,
 }
@@ -77,6 +78,7 @@ fn parse_config() -> Config {
 
     let broker_type = match env_var("BROKER_TYPE", "nats").to_lowercase().as_str() {
         "redpanda" => BrokerType::Redpanda,
+        "kafka" => BrokerType::Kafka,
         "grpc" => BrokerType::Grpc,
         _ => BrokerType::Nats,
     };
@@ -84,7 +86,7 @@ fn parse_config() -> Config {
     let broker_endpoint = env_var(
         "BROKER_ENDPOINT",
         match broker_type {
-            BrokerType::Redpanda => "localhost:9092",
+            BrokerType::Redpanda | BrokerType::Kafka => "localhost:9092",
             BrokerType::Nats => "localhost:4222",
             BrokerType::Grpc => "0.0.0.0:50051",
         },
@@ -369,6 +371,7 @@ fn write_consumer_csv_row(
 fn broker_type_str(bt: &BrokerType) -> &'static str {
     match bt {
         BrokerType::Redpanda => "redpanda",
+        BrokerType::Kafka => "kafka",
         BrokerType::Nats => "nats",
         BrokerType::Grpc => "grpc",
     }
@@ -772,10 +775,10 @@ fn emit_consumer_csv(
 
     write_csv_header(&mut f);
 
-    // NATS uses 1 stream per size; Redpanda and gRPC use num_partitions topics
+    // NATS uses 1 stream per size; Redpanda, Kafka, and gRPC use num_partitions topics
     let partition_count = match cfg.broker_type {
         BrokerType::Nats => 1,
-        BrokerType::Redpanda | BrokerType::Grpc => cfg.num_partitions,
+        BrokerType::Redpanda | BrokerType::Kafka | BrokerType::Grpc => cfg.num_partitions,
     };
 
     for (size_bytes, size_label, _) in streams {
@@ -1065,6 +1068,8 @@ async fn main() {
         (Role::Consumer, BrokerType::Nats) => nats_consumer(cfg).await,
         (Role::Producer, BrokerType::Redpanda) => redpanda_producer(cfg).await,
         (Role::Consumer, BrokerType::Redpanda) => redpanda_consumer(cfg).await,
+        (Role::Producer, BrokerType::Kafka) => redpanda_producer(cfg).await,
+        (Role::Consumer, BrokerType::Kafka) => redpanda_consumer(cfg).await,
         (Role::Producer, BrokerType::Grpc) => grpc_producer(cfg).await,
         (Role::Consumer, BrokerType::Grpc) => grpc_consumer(cfg).await,
     }

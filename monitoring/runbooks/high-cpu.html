@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>High CPU Usage | Redpanda Runbook</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #111; color: #eee; }
+    h1 { color: #e6522c; }
+    h2 { color: #f78764; border-bottom: 1px solid #333; padding-bottom: 6px; }
+    a { color: #f78764; }
+    code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+    pre { background: #222; padding: 16px; border-radius: 6px; overflow-x: auto; }
+    .back { margin-bottom: 24px; }
+    .severity { display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 0.85em; background: #c0392b; }
+  </style>
+</head>
+<body>
+  <div class="back"><a href="index.html">← All Runbooks</a></div>
+  <h1>High CPU Usage</h1>
+  <span class="severity">WARNING / CRITICAL</span>
+
+  <h2>What This Means</h2>
+  <p>One or more Redpanda reactor shards are running at or near 100% CPU. Redpanda uses a thread-per-core model — a saturated shard will cause latency spikes and may drop requests.</p>
+
+  <h2>Likely Causes</h2>
+  <ul>
+    <li>Throughput exceeding the broker's single-node capacity</li>
+    <li>Too many partitions assigned to too few cores (<code>--smp</code>)</li>
+    <li>Compaction or internal background tasks running hot</li>
+    <li>High produce rate with small messages (high request overhead)</li>
+  </ul>
+
+  <h2>Recommended Actions</h2>
+  <ol>
+    <li>Identify which shard is hot — check <strong>CPU Busy</strong> panel per shard legend.</li>
+    <li>Reduce produce rate or <code>GBPS_TARGET</code> in the benchmarker to back off load.</li>
+    <li>Increase <code>--smp</code> in the Redpanda docker-compose command to give it more cores.</li>
+    <li>Increase <code>linger.ms</code> and <code>batch.size</code> on producers to amortise CPU cost per byte.</li>
+    <li>Reduce partition count — fewer partitions per shard lowers scheduling overhead.</li>
+    <li>Check whether compaction is running: <pre>curl -s http://localhost:9644/v1/debug/storage</pre></li>
+  </ol>
+
+  <h2>Metrics to Watch</h2>
+  <ul>
+    <li><code>redpanda_cpu_busy_seconds_total</code> — per-shard CPU time</li>
+    <li><code>redpanda_kafka_request_bytes_total</code> — incoming load</li>
+    <li><code>redpanda_scheduler_runtime_seconds_total</code> — reactor runtime</li>
+  </ul>
+</body>
+</html>

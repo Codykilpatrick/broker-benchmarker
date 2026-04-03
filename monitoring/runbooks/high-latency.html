@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>High Request Latency | Redpanda Runbook</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #111; color: #eee; }
+    h1 { color: #e6522c; }
+    h2 { color: #f78764; border-bottom: 1px solid #333; padding-bottom: 6px; }
+    a { color: #f78764; }
+    code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+    pre { background: #222; padding: 16px; border-radius: 6px; overflow-x: auto; }
+    .back { margin-bottom: 24px; }
+    .severity { display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 0.85em; background: #c0392b; }
+  </style>
+</head>
+<body>
+  <div class="back"><a href="index.html">← All Runbooks</a></div>
+  <h1>High Request Latency</h1>
+  <span class="severity">WARNING / CRITICAL</span>
+
+  <h2>What This Means</h2>
+  <p>Kafka request latency (p95 or p99) has exceeded the alert threshold. Producers and consumers may be experiencing slow responses, which can cause backpressure, consumer lag, or timeouts.</p>
+
+  <h2>Likely Causes</h2>
+  <ul>
+    <li>Broker CPU saturation — a shard is near 100% busy</li>
+    <li>Partition count too high for available memory/CPU</li>
+    <li>Large message sizes causing I/O pressure</li>
+    <li>Insufficient <code>linger.ms</code> or batch settings causing too many small requests</li>
+    <li>Disk I/O bottleneck (slow fsync)</li>
+  </ul>
+
+  <h2>Recommended Actions</h2>
+  <ol>
+    <li>Check the <strong>CPU Busy</strong> panel in Grafana — if any shard is near 1.0, the broker is CPU-bound.</li>
+    <li>Check the <strong>Kafka Bytes In/Out</strong> rates — if throughput is near the NIC limit, consider scaling.</li>
+    <li>Reduce partition count if it exceeds <code>cores × 1000</code> guideline.</li>
+    <li>Tune producer <code>linger.ms</code> (try 5–10ms) and <code>batch.size</code> to reduce request frequency.</li>
+    <li>Check disk I/O with: <pre>docker exec monitoring-redpanda-1 iostat -x 1 5</pre></li>
+    <li>If running on Docker Desktop (Mac/Windows), note that disk I/O is virtualised and will be slower than bare metal.</li>
+  </ol>
+
+  <h2>Metrics to Watch</h2>
+  <ul>
+    <li><code>redpanda_kafka_request_latency_seconds_bucket</code> — histogram of request latency</li>
+    <li><code>redpanda_cpu_busy_seconds_total</code> — per-shard CPU utilisation</li>
+    <li><code>redpanda_kafka_request_bytes_total</code> — throughput rate</li>
+  </ul>
+</body>
+</html>

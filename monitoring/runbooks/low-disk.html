@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Low Disk Space | Redpanda Runbook</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #111; color: #eee; }
+    h1 { color: #e6522c; }
+    h2 { color: #f78764; border-bottom: 1px solid #333; padding-bottom: 6px; }
+    a { color: #f78764; }
+    code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+    pre { background: #222; padding: 16px; border-radius: 6px; overflow-x: auto; }
+    .back { margin-bottom: 24px; }
+    .severity { display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 0.85em; background: #e67e22; }
+  </style>
+</head>
+<body>
+  <div class="back"><a href="index.html">← All Runbooks</a></div>
+  <h1>Low Disk Space</h1>
+  <span class="severity">WARNING</span>
+
+  <h2>What This Means</h2>
+  <p>The Redpanda data directory is running low on free space. If disk fills completely, Redpanda will stop accepting writes and the broker will become unavailable.</p>
+
+  <h2>Likely Causes</h2>
+  <ul>
+    <li>Retention policy not configured — logs growing unbounded</li>
+    <li>High write throughput with no segment cleanup</li>
+    <li>Docker volume on a small partition</li>
+  </ul>
+
+  <h2>Recommended Actions</h2>
+  <ol>
+    <li>Check current disk usage: <pre>docker exec monitoring-redpanda-1 df -h /var/lib/redpanda</pre></li>
+    <li>Set a retention policy on benchmark topics to free space:
+      <pre>docker exec monitoring-redpanda-1 rpk topic alter-config benchmark_64kb_0 \
+  --set retention.bytes=536870912</pre>
+    </li>
+    <li>Trigger log cleanup manually: <pre>docker exec monitoring-redpanda-1 rpk cluster storage recovery start</pre></li>
+    <li>For the benchmark specifically — delete and recreate topics between runs to avoid accumulation:
+      <pre>docker exec monitoring-redpanda-1 rpk topic delete benchmark_64kb_0 benchmark_1mb_0 benchmark_12mb_0 benchmark_32mb_0</pre>
+    </li>
+    <li>If running persistently, add a Docker volume size limit or move the data directory to a larger disk.</li>
+  </ol>
+
+  <h2>Metrics to Watch</h2>
+  <ul>
+    <li><code>redpanda_storage_disk_free_bytes</code> — free bytes on data partition</li>
+    <li><code>redpanda_storage_disk_total_bytes</code> — total capacity</li>
+  </ul>
+</body>
+</html>

@@ -7,6 +7,10 @@ Emits CSV results to a file — capture it with `kubectl logs` or read directly 
 
 ## Quick-start (local smoke test)
 
+> **Note:** Set environment variables with `export` before running `cargo run`.
+> Inline env vars on the same line as `cargo run` can be misinterpreted by some shells
+> and silently fall back to defaults.
+
 ### Redpanda (with monitoring stack)
 
 ```bash
@@ -14,14 +18,28 @@ Emits CSV results to a file — capture it with `kubectl logs` or read directly 
 cd monitoring && docker compose up -d
 
 # Terminal 1 — consumer (start first)
-ROLE=consumer BROKER_TYPE=redpanda BROKER_ENDPOINT=localhost:9092 \
-  GBPS_TARGET=1.0 RUN_MODE=combined RUN_DURATION_SECS=60 PARTITIONS=4 \
-  cargo run --release
+export ROLE=consumer
+export BROKER_TYPE=redpanda
+export BROKER_ENDPOINT=localhost:9092
+export GBPS_TARGET=10
+export RUN_MODE=combined
+export RUN_DURATION_SECS=60
+export PARTITIONS=16
+export CONSUMER_TASKS=16
+export REPORT_INTERVAL_SECS=5
+cargo run --release
 
 # Terminal 2 — producer
-ROLE=producer BROKER_TYPE=redpanda BROKER_ENDPOINT=localhost:9092 \
-  GBPS_TARGET=1.0 RUN_MODE=combined RUN_DURATION_SECS=60 PARTITIONS=4 \
-  cargo run --release
+export ROLE=producer
+export BROKER_TYPE=redpanda
+export BROKER_ENDPOINT=localhost:9092
+export GBPS_TARGET=10
+export RUN_MODE=combined
+export RUN_DURATION_SECS=60
+export PARTITIONS=16
+export PRODUCER_TASKS=16
+export REPORT_INTERVAL_SECS=5
+cargo run --release
 ```
 
 Grafana dashboard: http://localhost:3000 (admin/admin)
@@ -33,14 +51,22 @@ Runbooks: http://localhost:8090
 ```bash
 docker run -d --name nats -p 4222:4222 nats:latest -js
 
-ROLE=consumer BROKER_TYPE=nats BROKER_ENDPOINT=localhost:4222 \
-  GBPS_TARGET=0.01 RUN_MODE=64kb RUN_DURATION_SECS=30 \
-  cargo run --release
+export ROLE=consumer
+export BROKER_TYPE=nats
+export BROKER_ENDPOINT=localhost:4222
+export GBPS_TARGET=0.01
+export RUN_MODE=64kb
+export RUN_DURATION_SECS=30
+cargo run --release
 
-ROLE=producer BROKER_TYPE=nats BROKER_ENDPOINT=localhost:4222 \
-  GBPS_TARGET=0.01 RUN_MODE=64kb RUN_DURATION_SECS=30 \
-  PRODUCER_START_DELAY_SECS=5 \
-  cargo run --release
+export ROLE=producer
+export BROKER_TYPE=nats
+export BROKER_ENDPOINT=localhost:4222
+export GBPS_TARGET=0.01
+export RUN_MODE=64kb
+export RUN_DURATION_SECS=30
+export PRODUCER_START_DELAY_SECS=5
+cargo run --release
 ```
 
 ---
@@ -102,7 +128,11 @@ Create users in **Administration → Users** in Grafana.
 | `BROKER_ENDPOINT` | `localhost:4222` / `localhost:9092` | Broker address |
 | `GBPS_TARGET` | `1.0` | Target throughput in Gbps |
 | `RUN_MODE` | `combined` | `combined`, `64kb`, `1mb`, `12mb`, or `32mb` |
-| `PARTITIONS` | `4` | Number of Kafka/Redpanda partitions per topic |
+| `PARTITIONS` | `16` | Number of Kafka/Redpanda partitions per topic |
+| `PRODUCER_TASKS` | `$PARTITIONS` | Parallel producer tasks (independent of partition count) |
+| `CONSUMER_TASKS` | `$PARTITIONS` | Parallel consumer instances (each assigned a partition slice) |
+| `PAYLOAD_TYPE` | `float32` | `float32` (correlated sensor data, LZ4-compressible) or `random_bytes` (entropy baseline) |
+| `REPORT_INTERVAL_SECS` | `5` | Seconds between real-time throughput prints to stderr (0 = off) |
 | `TOPIC_PREFIX` | `benchmark` | Prefix for topic/subject names |
 | `RUN_DURATION_SECS` | `120` | How long to run (seconds) |
 | `PRODUCER_START_DELAY_SECS` | `10` | Producer waits this long before sending |

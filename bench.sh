@@ -43,7 +43,7 @@ while [[ $# -gt 0 ]]; do
       echo "Usage: $0 [options]"
       echo ""
       echo "  --gbps N            Target throughput in Gbps        (default: 10)"
-      echo "  --mode MODE         combined|64kb|1mb|12mb|32mb      (default: combined)"
+      echo "  --mode MODE         combined|24b|256b|4kb|64kb|512kb|4mb|16mb|80mb  (default: combined)"
       echo "  --duration N        Run duration in seconds          (default: 60)"
       echo "  --partitions N      Partitions, producer & consumer  (default: 16)"
       echo "  --producer-tasks N  Producer task count              (default: PARTITIONS)"

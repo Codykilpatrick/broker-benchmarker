@@ -19,10 +19,14 @@ use tokio::time::{interval, sleep, Instant};
 // ─── Message sizes ──────────────────────────────────────────────────────────
 
 const MESSAGE_SIZES: &[(u64, &str)] = &[
-    (65_536, "64kb"),
-    (1_048_576, "1mb"),
-    (12_582_912, "12mb"),
-    (33_554_432, "32mb"),
+    (24,          "24b"),
+    (256,         "256b"),
+    (4_096,       "4kb"),
+    (65_536,      "64kb"),
+    (524_288,     "512kb"),
+    (4_194_304,   "4mb"),
+    (16_777_216,  "16mb"),
+    (83_886_080,  "80mb"),
 ];
 
 const HEADER_LEN: usize = 24;
@@ -46,10 +50,14 @@ enum BrokerType {
 #[derive(Debug, Clone, PartialEq)]
 enum RunMode {
     Combined,
+    Only24b,
+    Only256b,
+    Only4kb,
     Only64kb,
-    Only1mb,
-    Only12mb,
-    Only32mb,
+    Only512kb,
+    Only4mb,
+    Only16mb,
+    Only80mb,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -83,6 +91,9 @@ struct Config {
     report_interval_secs: u64,
     /// Payload content type — float32 (realistic sensor data) or random_bytes (baseline).
     payload_type: PayloadType,
+    /// Maximum messages per second per stream. Bandwidth is redistributed from
+    /// capped (small message) streams to uncapped (large message) streams.
+    max_msg_rate: u64,
 }
 
 fn env_var(key: &str, default: &str) -> String {
@@ -116,11 +127,15 @@ fn parse_config() -> Config {
         .expect("GBPS_TARGET must be a float");
 
     let run_mode = match env_var("RUN_MODE", "combined").to_lowercase().as_str() {
-        "64kb" => RunMode::Only64kb,
-        "1mb" => RunMode::Only1mb,
-        "12mb" => RunMode::Only12mb,
-        "32mb" => RunMode::Only32mb,
-        _ => RunMode::Combined,
+        "24b"   => RunMode::Only24b,
+        "256b"  => RunMode::Only256b,
+        "4kb"   => RunMode::Only4kb,
+        "64kb"  => RunMode::Only64kb,
+        "512kb" => RunMode::Only512kb,
+        "4mb"   => RunMode::Only4mb,
+        "16mb"  => RunMode::Only16mb,
+        "80mb"  => RunMode::Only80mb,
+        _       => RunMode::Combined,
     };
 
     let topic_prefix = env_var("TOPIC_PREFIX", "benchmark");
@@ -162,6 +177,11 @@ fn parse_config() -> Config {
         _ => PayloadType::Float32,
     };
 
+    let max_msg_rate: u64 = env_var("MAX_MSG_RATE", "100")
+        .parse()
+        .expect("MAX_MSG_RATE must be a positive integer");
+    let max_msg_rate = max_msg_rate.max(1);
+
     Config {
         role,
         broker_type,
@@ -178,23 +198,91 @@ fn parse_config() -> Config {
         num_consumer_tasks,
         report_interval_secs,
         payload_type,
+        max_msg_rate,
     }
 }
 
 // ─── Active streams ───────────────────────────────────────────────────────────
 
-/// Returns (size_bytes, size_label, fraction_of_gbps_target) for each active stream.
-fn active_streams(mode: &RunMode) -> Vec<(u64, &'static str, f64)> {
-    match mode {
-        RunMode::Combined => MESSAGE_SIZES
-            .iter()
-            .map(|(size, label)| (*size, *label, 0.25))
-            .collect(),
-        RunMode::Only64kb => vec![(65_536, "64kb", 1.0)],
-        RunMode::Only1mb => vec![(1_048_576, "1mb", 1.0)],
-        RunMode::Only12mb => vec![(12_582_912, "12mb", 1.0)],
-        RunMode::Only32mb => vec![(33_554_432, "32mb", 1.0)],
+/// Water-filling bandwidth allocation subject to a per-stream message rate cap.
+///
+/// Streams that would require more than `max_msg_rate` msg/s get capped; their
+/// unused bandwidth is redistributed to uncapped (larger) streams. This ensures
+/// small-message streams are tested at realistic rates while large-message streams
+/// absorb the remaining bandwidth budget.
+///
+/// Returns msg/s for each stream in the same order as `sizes`.
+fn water_fill_rates(sizes: &[u64], bytes_per_sec_total: f64, max_msg_rate: f64) -> Vec<f64> {
+    let n = sizes.len();
+    let mut rates = vec![0.0f64; n];
+    let mut capped = vec![false; n];
+    let mut remaining_bps = bytes_per_sec_total;
+    let mut uncapped_count = n;
+
+    loop {
+        if uncapped_count == 0 {
+            break;
+        }
+        let bps_each = remaining_bps / uncapped_count as f64;
+        let mut any_newly_capped = false;
+
+        for i in 0..n {
+            if capped[i] {
+                continue;
+            }
+            let msg_s = bps_each / sizes[i] as f64;
+            if msg_s > max_msg_rate {
+                rates[i] = max_msg_rate;
+                capped[i] = true;
+                remaining_bps -= max_msg_rate * sizes[i] as f64;
+                uncapped_count -= 1;
+                any_newly_capped = true;
+            }
+        }
+
+        if !any_newly_capped {
+            // All remaining streams fit within the cap — assign equal share
+            for i in 0..n {
+                if !capped[i] {
+                    rates[i] = bps_each / sizes[i] as f64;
+                }
+            }
+            break;
+        }
     }
+
+    rates
+}
+
+/// Returns (size_bytes, size_label, fraction_of_gbps_target) for each active stream.
+///
+/// `fraction` is derived from the water-filled allocation so downstream rate math
+/// stays unchanged: `msgs_per_sec = bytes_per_sec * fraction / size_bytes`.
+fn active_streams(mode: &RunMode, gbps_target: f64, max_msg_rate: u64) -> Vec<(u64, &'static str, f64)> {
+    let sizes: &[(u64, &str)] = match mode {
+        RunMode::Combined => MESSAGE_SIZES,
+        RunMode::Only24b   => &[(24,         "24b")],
+        RunMode::Only256b  => &[(256,        "256b")],
+        RunMode::Only4kb   => &[(4_096,      "4kb")],
+        RunMode::Only64kb  => &[(65_536,     "64kb")],
+        RunMode::Only512kb => &[(524_288,    "512kb")],
+        RunMode::Only4mb   => &[(4_194_304,  "4mb")],
+        RunMode::Only16mb  => &[(16_777_216, "16mb")],
+        RunMode::Only80mb  => &[(83_886_080, "80mb")],
+    };
+
+    let bytes_per_sec_total = gbps_target * 1_000_000_000.0 / 8.0;
+    let size_bytes: Vec<u64> = sizes.iter().map(|(s, _)| *s).collect();
+    let rates = water_fill_rates(&size_bytes, bytes_per_sec_total, max_msg_rate as f64);
+
+    sizes.iter().zip(rates.iter()).map(|((size, label), &rate)| {
+        let fraction = if bytes_per_sec_total > 0.0 {
+            (rate * *size as f64) / bytes_per_sec_total
+        } else {
+            0.0
+        };
+        (*size, *label, fraction)
+    }).collect()
 }
 
 // ─── Topic naming ─────────────────────────────────────────────────────────────
@@ -211,10 +299,15 @@ fn stream_name_from_topic(topic: &str) -> String {
 // ─── Message encode / decode ─────────────────────────────────────────────────
 
 fn encode_message(buf: &mut Vec<u8>, producer_ts_ns: u64, seq: u64, stream_id: u64) {
+    if buf.len() < HEADER_LEN {
+        // Message too small for the full tracking header — skip.
+        // These messages will be counted as received but won't contribute to
+        // latency or loss stats (decode_header returns None for short buffers).
+        return;
+    }
     buf[0..8].copy_from_slice(&producer_ts_ns.to_be_bytes());
     buf[8..16].copy_from_slice(&seq.to_be_bytes());
     buf[16..24].copy_from_slice(&stream_id.to_be_bytes());
-    // remainder is zero-padding (already zeroed from allocation)
 }
 
 fn decode_header(data: &[u8]) -> Option<(u64, u64, u64)> {
@@ -421,11 +514,15 @@ fn broker_type_str(bt: &BrokerType) -> &'static str {
 
 fn run_mode_str(rm: &RunMode) -> &'static str {
     match rm {
-        RunMode::Combined => "combined",
-        RunMode::Only64kb => "64kb",
-        RunMode::Only1mb => "1mb",
-        RunMode::Only12mb => "12mb",
-        RunMode::Only32mb => "32mb",
+        RunMode::Combined  => "combined",
+        RunMode::Only24b   => "24b",
+        RunMode::Only256b  => "256b",
+        RunMode::Only4kb   => "4kb",
+        RunMode::Only64kb  => "64kb",
+        RunMode::Only512kb => "512kb",
+        RunMode::Only4mb   => "4mb",
+        RunMode::Only16mb  => "16mb",
+        RunMode::Only80mb  => "80mb",
     }
 }
 
@@ -486,7 +583,7 @@ async fn nats_producer(cfg: Config) {
     sleep(Duration::from_secs(cfg.producer_start_delay_secs)).await;
     eprintln!("[producer] connecting to NATS at {}", cfg.broker_endpoint);
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let bytes_per_sec = cfg.gbps_target * 1_000_000_000.0 / 8.0;
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
@@ -563,7 +660,7 @@ async fn nats_producer(cfg: Config) {
 async fn nats_consumer(cfg: Config) {
     eprintln!("[consumer] connecting to NATS at {}", cfg.broker_endpoint);
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
     // One task per stream, each with its own TCP connection so streams receive in parallel.
@@ -638,7 +735,7 @@ async fn rdkafka_ensure_topics(broker: &str, topics: &[String], num_partitions: 
         .iter()
         .map(|t| {
             NewTopic::new(t, num_partitions as i32, TopicReplication::Fixed(1))
-                .set("max.message.bytes", "67108864")
+                .set("max.message.bytes", "104857600") // 100 MB (covers 80 MB payload)
                 .set("compression.type", "lz4")
         })
         .collect();
@@ -669,7 +766,7 @@ async fn redpanda_producer(cfg: Config) {
         cfg.broker_endpoint, cfg.num_producer_tasks, cfg.num_partitions, cfg.payload_type
     );
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let topics: Vec<String> = streams
         .iter()
         .map(|(_, label, _)| topic_name(&cfg.topic_prefix, label, 0))
@@ -679,7 +776,7 @@ async fn redpanda_producer(cfg: Config) {
 
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &cfg.broker_endpoint)
-        .set("message.max.bytes", "67108864")          // 64 MB max message
+        .set("message.max.bytes", "104857600")         // 100 MB max message (covers 80 MB payload)
         .set("queue.buffering.max.messages", "1000000")
         .set("queue.buffering.max.kbytes", "4194304")  // 4 GB buffer
         .set("queue.buffering.max.ms", "50")           // linger 50ms for larger batches
@@ -761,30 +858,40 @@ async fn redpanda_producer(cfg: Config) {
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
                         let ts = now_ns();
                         encode_message(&mut buf, ts, seq, stream_id);
-                        let record = FutureRecord::to(&topic2)
-                            .key(key.as_str())
-                            .partition(partition)
-                            .payload(&buf[..]);
                         let topic_clone = topic2.clone();
                         let bytes_sent = size_bytes;
                         let counter2 = counter.clone();
-                        match producer2.send_result(record) {
-                            Ok(future) => {
-                                tokio::spawn(async move {
-                                    match future.await {
-                                        Ok(Ok(_)) => {
-                                            counter2.fetch_add(bytes_sent, Ordering::Relaxed);
-                                        }
-                                        Ok(Err((e, _))) => eprintln!("[producer] delivery error on {}: {}", topic_clone, e),
-                                        Err(_) => eprintln!("[producer] delivery canceled on {}", topic_clone),
+                        // Retry on QueueFull so the producer naturally backs off
+                        // when the broker can't keep up, rather than dropping messages.
+                        let future = loop {
+                            let r = FutureRecord::to(&topic2)
+                                .key(key.as_str())
+                                .partition(partition)
+                                .payload(&buf[..]);
+                            match producer2.send_result(r) {
+                                Ok(f) => break Some(f),
+                                Err((e, _)) if e.to_string().contains("QueueFull") => {
+                                    sleep(Duration::from_millis(10)).await;
+                                }
+                                Err((e, _)) => {
+                                    eprintln!("[producer] enqueue error on {}: {}", topic2, e);
+                                    break None;
+                                }
+                            }
+                        };
+                        if let Some(future) = future {
+                            tokio::spawn(async move {
+                                match future.await {
+                                    Ok(Ok(_)) => {
+                                        counter2.fetch_add(bytes_sent, Ordering::Relaxed);
                                     }
-                                    drop(permit);
-                                });
-                            }
-                            Err((e, _)) => {
-                                eprintln!("[producer] enqueue error on {}: {}", topic2, e);
+                                    Ok(Err((e, _))) => eprintln!("[producer] delivery error on {}: {}", topic_clone, e),
+                                    Err(_) => eprintln!("[producer] delivery canceled on {}", topic_clone),
+                                }
                                 drop(permit);
-                            }
+                            });
+                        } else {
+                            drop(permit);
                         }
                         seq += 1;
                     }
@@ -821,7 +928,7 @@ async fn redpanda_consumer(cfg: Config) {
         cfg.broker_endpoint, cfg.num_consumer_tasks, cfg.num_partitions
     );
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let topics: Vec<String> = streams
         .iter()
         .map(|(_, label, _)| topic_name(&cfg.topic_prefix, label, 0))
@@ -859,8 +966,8 @@ async fn redpanda_consumer(cfg: Config) {
             .set("group.id", &format!("bench-{}-{}", cfg.run_id, task_i))
             .set("auto.offset.reset", "latest")
             .set("enable.auto.commit", "false")
-            .set("fetch.message.max.bytes", "67108864")    // 64 MB per fetch
-            .set("fetch.max.bytes", "134217728")            // 128 MB total per poll
+            .set("fetch.message.max.bytes", "104857600")   // 100 MB per message (handles 80 MB)
+            .set("fetch.max.bytes", "209715200")            // 200 MB total per poll
             .set("receive.message.max.bytes", "268435456") // must be > fetch.max.bytes + 512
             .set("fetch.wait.max.ms", "5")
             .set("socket.receive.buffer.bytes", "67108864")
@@ -1167,7 +1274,7 @@ async fn grpc_consumer(cfg: Config) {
         cfg.broker_endpoint
     );
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
 
     // Shared stats map keyed by stream_id (size_bytes * 1000 + partition).
     let stats: Arc<Mutex<HashMap<u64, StreamStats>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -1264,7 +1371,7 @@ async fn grpc_producer(cfg: Config) {
         .await
         .expect("gRPC connect failed");
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let bytes_per_sec = cfg.gbps_target * 1_000_000_000.0 / 8.0;
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
@@ -1430,19 +1537,27 @@ mod tests {
 
     #[test]
     fn test_active_streams_combined() {
-        let s = active_streams(&RunMode::Combined);
-        assert_eq!(s.len(), 4);
+        // Combined mode should return all 8 message sizes
+        let s = active_streams(&RunMode::Combined, 10.0, 100);
+        assert_eq!(s.len(), 8);
+        // Fractions must sum to 1.0
+        let total: f64 = s.iter().map(|(_, _, f)| f).sum();
+        assert!((total - 1.0).abs() < 1e-6);
+        // All fractions must be positive
         for (_, _, frac) in &s {
-            assert!((frac - 0.25).abs() < 1e-9);
+            assert!(*frac > 0.0);
         }
     }
 
     #[test]
     fn test_active_streams_single() {
-        let s = active_streams(&RunMode::Only64kb);
+        // Single-size mode returns exactly one stream
+        let s = active_streams(&RunMode::Only64kb, 10.0, 100);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].0, 65_536);
-        assert!((s[0].2 - 1.0).abs() < 1e-9);
+        // Fraction must be positive and <= 1.0
+        assert!(s[0].2 > 0.0);
+        assert!(s[0].2 <= 1.0 + 1e-9);
     }
 
     #[test]

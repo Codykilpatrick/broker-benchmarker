@@ -127,11 +127,12 @@ Create users in **Administration → Users** in Grafana.
 | `BROKER_TYPE` | `nats` | `nats`, `redpanda`, `kafka`, or `grpc` |
 | `BROKER_ENDPOINT` | `localhost:4222` / `localhost:9092` | Broker address |
 | `GBPS_TARGET` | `1.0` | Target throughput in Gbps |
-| `RUN_MODE` | `combined` | `combined`, `64kb`, `1mb`, `12mb`, or `32mb` |
+| `RUN_MODE` | `combined` | `combined`, `24b`, `256b`, `4kb`, `64kb`, `512kb`, `4mb`, `16mb`, or `80mb` |
 | `PARTITIONS` | `16` | Number of Kafka/Redpanda partitions per topic |
 | `PRODUCER_TASKS` | `$PARTITIONS` | Parallel producer tasks (independent of partition count) |
 | `CONSUMER_TASKS` | `$PARTITIONS` | Parallel consumer instances (each assigned a partition slice) |
 | `PAYLOAD_TYPE` | `float32` | `float32` (correlated sensor data, LZ4-compressible) or `random_bytes` (entropy baseline) |
+| `MAX_MSG_RATE` | `100` | Max messages/sec per stream; water-filling redistributes unused bandwidth to larger streams |
 | `REPORT_INTERVAL_SECS` | `5` | Seconds between real-time throughput prints to stderr (0 = off) |
 | `TOPIC_PREFIX` | `benchmark` | Prefix for topic/subject names |
 | `RUN_DURATION_SECS` | `120` | How long to run (seconds) |
@@ -141,13 +142,20 @@ Create users in **Administration → Users** in Grafana.
 
 ### Run modes
 
-| Mode | Active streams | Allocation |
-|------|---------------|------------|
-| `combined` | 64 KB + 1 MB + 12 MB + 32 MB | 25% of target each |
-| `64kb` | 64 KB only | 100% of target |
-| `1mb` | 1 MB only | 100% of target |
-| `12mb` | 12 MB only | 100% of target |
-| `32mb` | 32 MB only | 100% of target |
+Bandwidth is allocated via water-filling: small-message streams are capped at `MAX_MSG_RATE` msg/s and any
+unallocated bandwidth is redistributed to larger-message streams.
+
+| Mode | Active streams |
+|------|---------------|
+| `combined` | all 8 sizes (24 B → 80 MB) |
+| `24b` | 24 B only |
+| `256b` | 256 B only |
+| `4kb` | 4 KB only |
+| `64kb` | 64 KB only |
+| `512kb` | 512 KB only |
+| `4mb` | 4 MB only |
+| `16mb` | 16 MB only |
+| `80mb` | 80 MB only |
 
 ---
 

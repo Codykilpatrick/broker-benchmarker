@@ -1,44 +1,86 @@
 # Broker Benchmarker
 
 Stress-tests **Redpanda** and **NATS** under identical workloads.
-Emits CSV results to a file — capture it with `kubectl logs` or read directly from disk.
+Produces a markdown benchmark report and CSV results after each run.
 
 ---
 
-## Quick-start (local smoke test)
+## Quick-start
 
-> **Note:** Set environment variables with `export` before running `cargo run`.
-> Inline env vars on the same line as `cargo run` can be misinterpreted by some shells
-> and silently fall back to defaults.
+### Redpanda — one command (recommended)
 
-### Redpanda (with monitoring stack)
+The `bench.sh` script starts the monitoring stack, builds the benchmarker image, and runs producer + consumer inside the Docker network so traffic never crosses the host↔VM boundary.
 
 ```bash
-# Start Redpanda + Prometheus + Grafana + Runbooks
+# Start Redpanda + Prometheus + Grafana + Runbooks (first time only)
+cd monitoring && docker compose up -d && cd ..
+
+# Run a full benchmark — results land in ./results/
+./bench.sh --docker --gbps 10 --mode combined --duration 60 --partitions 16 --payload float32
+```
+
+Results are written to `results/report_<run_id>.md` and `results/consumer_redpanda_out_<run_id>.csv`.
+
+Example report output:
+
+```
+## Results
+| Message Size | Target Gbps | Achieved Gbps | Efficiency | Messages | Lost | p50 ms | p95 ms | p99 ms | max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 24b    | 2.50 | 0.000 | 0%  | 3713 | 0 |   958 |  1530 |  3306 | 10216 |
+| 256b   | 2.50 | 0.000 | 0%  | 4208 | 0 |   943 |  1269 |  3312 |  3318 |
+| 4kb    | 2.50 | 0.002 | 0%  | 4318 | 0 |   943 |  1276 |  3318 |  3332 |
+| 64kb   | 2.50 | 0.037 | 1%  | 4252 | 0 |   960 |  1444 |  3340 |  3394 |
+| 512kb  | 2.50 | 0.176 | 7%  | 2516 | 0 |  1000 |  3028 |  6528 | 34990 |
+| 4mb    | 2.50 | 0.962 | 38% | 1721 | 0 |  1406 |  4690 | 10275 | 32743 |
+| 16mb   | 2.50 | 0.960 | 38% |  429 | 0 |  2621 | 17192 | 25736 | 26507 |
+| 80mb   | 2.50 | 1.163 | 46% |  104 | 0 |  7941 | 34365 | 47073 | 50680 |
+
+## Summary
+| Metric          | Value     |
+| Target Gbps     | 10.0      |
+| Achieved Gbps   | 3.301     |
+| Efficiency      | 33%       |
+| Messages lost   | 0         |
+```
+
+> **Docker Desktop on macOS** caps container-to-container throughput at ~3–4 Gbps due to VM overhead. The same workload on bare-metal Linux reaches 6–10+ Gbps.
+
+### bench.sh options
+
+```
+./bench.sh [options]
+
+  --gbps N            Target throughput in Gbps                     (default: 10)
+  --mode MODE         combined|24b|256b|4kb|64kb|512kb|4mb|16mb|80mb (default: combined)
+  --duration N        Run duration in seconds                        (default: 60)
+  --partitions N      Partitions, producer & consumer tasks          (default: 16)
+  --producer-tasks N  Producer task count                            (default: PARTITIONS)
+  --consumer-tasks N  Consumer task count                            (default: PARTITIONS)
+  --payload TYPE      float32|random_bytes                           (default: float32)
+  --endpoint HOST:PORT Broker address                                (default: localhost:9092)
+  --output-dir DIR    Where to write CSV + report                    (default: .)
+  --docker            Run benchmarker inside Docker network (no host↔VM hop)
+```
+
+### Redpanda — manual (native, no Docker for benchmarker)
+
+> **Note:** Use `export VAR=value` rather than inline env vars — zsh silently drops inline assignments before `cargo run`.
+
+```bash
+# Start monitoring stack
 cd monitoring && docker compose up -d
 
 # Terminal 1 — consumer (start first)
-export ROLE=consumer
-export BROKER_TYPE=redpanda
-export BROKER_ENDPOINT=localhost:9092
-export GBPS_TARGET=10
-export RUN_MODE=combined
-export RUN_DURATION_SECS=60
-export PARTITIONS=16
-export CONSUMER_TASKS=16
-export REPORT_INTERVAL_SECS=5
+export ROLE=consumer BROKER_TYPE=redpanda BROKER_ENDPOINT=localhost:9092
+export GBPS_TARGET=10 RUN_MODE=combined RUN_DURATION_SECS=60
+export PARTITIONS=16 CONSUMER_TASKS=16 REPORT_INTERVAL_SECS=5
 cargo run --release
 
 # Terminal 2 — producer
-export ROLE=producer
-export BROKER_TYPE=redpanda
-export BROKER_ENDPOINT=localhost:9092
-export GBPS_TARGET=10
-export RUN_MODE=combined
-export RUN_DURATION_SECS=60
-export PARTITIONS=16
-export PRODUCER_TASKS=16
-export REPORT_INTERVAL_SECS=5
+export ROLE=producer BROKER_TYPE=redpanda BROKER_ENDPOINT=localhost:9092
+export GBPS_TARGET=10 RUN_MODE=combined RUN_DURATION_SECS=60
+export PARTITIONS=16 PRODUCER_TASKS=16 REPORT_INTERVAL_SECS=5
 cargo run --release
 ```
 
@@ -51,20 +93,12 @@ Runbooks: http://localhost:8090
 ```bash
 docker run -d --name nats -p 4222:4222 nats:latest -js
 
-export ROLE=consumer
-export BROKER_TYPE=nats
-export BROKER_ENDPOINT=localhost:4222
-export GBPS_TARGET=0.01
-export RUN_MODE=64kb
-export RUN_DURATION_SECS=30
+export ROLE=consumer BROKER_TYPE=nats BROKER_ENDPOINT=localhost:4222
+export GBPS_TARGET=0.01 RUN_MODE=64kb RUN_DURATION_SECS=30
 cargo run --release
 
-export ROLE=producer
-export BROKER_TYPE=nats
-export BROKER_ENDPOINT=localhost:4222
-export GBPS_TARGET=0.01
-export RUN_MODE=64kb
-export RUN_DURATION_SECS=30
+export ROLE=producer BROKER_TYPE=nats BROKER_ENDPOINT=localhost:4222
+export GBPS_TARGET=0.01 RUN_MODE=64kb RUN_DURATION_SECS=30
 export PRODUCER_START_DELAY_SECS=5
 cargo run --release
 ```
@@ -178,9 +212,9 @@ docker build -t broker-benchmarker:latest .
 For an airgapped environment, pre-pull the builder image and push to your internal registry:
 
 ```bash
-docker pull rust:1.77
-docker tag rust:1.77 <internal-registry>/rust:1.77
-docker push <internal-registry>/rust:1.77
+docker pull rust:latest
+docker tag rust:latest <internal-registry>/rust:latest
+docker push <internal-registry>/rust:latest
 # Then update the FROM line in Dockerfile accordingly
 ```
 
@@ -218,31 +252,27 @@ kubectl logs -f deployment/benchmark-producer > producer.log
 ### Scenario 1: NATS — Combined load, 5 Gbps
 
 ```bash
-BROKER_TYPE=nats
-BROKER_ENDPOINT=nats.default.svc.cluster.local:4222
-GBPS_TARGET=5
-RUN_MODE=combined
-RUN_DURATION_SECS=120
+export BROKER_TYPE=nats
+export BROKER_ENDPOINT=nats.default.svc.cluster.local:4222
+export GBPS_TARGET=5
+export RUN_MODE=combined
+export RUN_DURATION_SECS=120
 ```
 
-### Scenario 2: Redpanda — 1 MB messages, 10 Gbps
+### Scenario 2: Redpanda — 4 MB messages, 10 Gbps
 
 ```bash
-BROKER_TYPE=redpanda
-BROKER_ENDPOINT=redpanda.default.svc.cluster.local:9092
-GBPS_TARGET=10
-RUN_MODE=1mb
-RUN_DURATION_SECS=120
+export BROKER_TYPE=redpanda
+export BROKER_ENDPOINT=redpanda.default.svc.cluster.local:9092
+export GBPS_TARGET=10
+export RUN_MODE=4mb
+export RUN_DURATION_SECS=120
 ```
 
-### Scenario 3: Redpanda — 32 MB messages (large payload)
+### Scenario 3: Redpanda — Full combined range (24 B → 80 MB), 10 Gbps
 
 ```bash
-BROKER_TYPE=redpanda
-BROKER_ENDPOINT=redpanda.default.svc.cluster.local:9092
-GBPS_TARGET=1
-RUN_MODE=32mb
-RUN_DURATION_SECS=120
+./bench.sh --docker --gbps 10 --mode combined --duration 120 --partitions 16 --payload float32
 ```
 
 ---
@@ -259,10 +289,14 @@ Example output (combined mode, Redpanda, consumer):
 
 ```
 role,broker_type,run_mode,gbps_target,message_size_bytes,run_duration_secs,messages_sent,messages_received,messages_lost,achieved_throughput_gbps,latency_p50_ms,latency_p95_ms,latency_p99_ms,latency_max_ms
-consumer,redpanda,combined,1.000,65536,60,,20389,0,0.178162,11.722,33.341,163.391,265.055
-consumer,redpanda,combined,1.000,1048576,60,,1220,0,0.170568,21.756,39.183,151.671,226.959
-consumer,redpanda,combined,1.000,12582912,60,,104,0,0.174483,70.259,207.175,249.735,263.519
-consumer,redpanda,combined,1.000,33554432,60,,40,0,0.178957,169.631,223.167,250.735,250.735
+consumer,redpanda,combined,10.000,24,60,,3713,0,0.000,958.0,1529.8,3306.0,10215.9
+consumer,redpanda,combined,10.000,256,60,,4208,0,0.000,942.5,1269.4,3312.0,3317.8
+consumer,redpanda,combined,10.000,4096,60,,4318,0,0.002,942.9,1275.5,3317.9,3331.8
+consumer,redpanda,combined,10.000,65536,60,,4252,0,0.037,960.2,1443.8,3340.3,3393.8
+consumer,redpanda,combined,10.000,524288,60,,2516,0,0.176,1000.4,3027.5,6527.7,34990.1
+consumer,redpanda,combined,10.000,4194304,60,,1721,0,0.962,1406.0,4689.9,10274.8,32743.4
+consumer,redpanda,combined,10.000,16777216,60,,429,0,0.960,2620.9,17191.9,25736.2,26507.3
+consumer,redpanda,combined,10.000,83886080,60,,104,0,1.163,7940.9,34365.4,47073.3,50679.8
 ```
 
 The producer CSV records `messages_sent` but not latency. The consumer CSV records `messages_received`, `messages_lost`, latency, and achieved throughput.

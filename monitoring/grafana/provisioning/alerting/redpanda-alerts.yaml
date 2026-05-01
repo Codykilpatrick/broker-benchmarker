@@ -1,0 +1,188 @@
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: Redpanda Alerts
+    folder: Redpanda
+    interval: 1m
+    rules:
+
+      - uid: redpanda-high-latency
+        title: High Request Latency (p99)
+        condition: C
+        for: 2m
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "Kafka p99 request latency is above 500ms"
+          description: "Request latency p99 has exceeded 500ms, which may indicate CPU saturation, too many partitions, or disk I/O pressure."
+          runbook_url: "http://localhost:8090/high-latency.html"
+        labels:
+          severity: warning
+        isPaused: false
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: "max(histogram_quantile(0.99, rate(redpanda_kafka_request_latency_seconds_bucket[1m])))"
+              refId: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.5] }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+
+      - uid: redpanda-high-cpu
+        title: High CPU Usage
+        condition: C
+        for: 2m
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "Redpanda shard CPU usage is above 80%"
+          description: "A reactor shard is running above 80% CPU. Sustained saturation will cause latency spikes and dropped requests."
+          runbook_url: "http://localhost:8090/high-cpu.html"
+        labels:
+          severity: warning
+        isPaused: false
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: "max(rate(redpanda_cpu_busy_seconds_total[1m]))"
+              refId: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0.8] }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+
+      - uid: redpanda-low-disk
+        title: Low Disk Space
+        condition: C
+        for: 5m
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "Redpanda disk free space is below 20%"
+          description: "The data partition has less than 20% free space remaining. If disk fills completely, Redpanda will stop accepting writes."
+          runbook_url: "http://localhost:8090/low-disk.html"
+        labels:
+          severity: warning
+        isPaused: false
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: "min(redpanda_storage_disk_free_bytes / redpanda_storage_disk_total_bytes)"
+              refId: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: lt, params: [0.2] }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query
+
+      - uid: redpanda-under-replicated
+        title: Under-Replicated Partitions
+        condition: C
+        for: 1m
+        noDataState: NoData
+        execErrState: Error
+        annotations:
+          summary: "One or more partitions are under-replicated"
+          description: "One or more partitions have fewer in-sync replicas than required. Data durability is degraded until resolved."
+          runbook_url: "http://localhost:8090/under-replicated.html"
+        labels:
+          severity: critical
+        isPaused: false
+        data:
+          - refId: A
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: PBFA97CFB590B2093
+            model:
+              expr: "sum(redpanda_kafka_under_replicated_replicas)"
+              refId: A
+              intervalMs: 1000
+              maxDataPoints: 43200
+          - refId: B
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: B
+              type: reduce
+              expression: A
+              reducer: last
+              settings: { mode: dropNN }
+          - refId: C
+            relativeTimeRange: { from: 300, to: 0 }
+            datasourceUid: "__expr__"
+            model:
+              refId: C
+              type: threshold
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+                  operator: { type: and }
+                  query: { params: [B] }
+                  reducer: { type: last }
+                  type: query

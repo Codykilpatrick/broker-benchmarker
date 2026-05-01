@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Under-Replicated Partitions | Redpanda Runbook</title>
+  <style>
+    body { font-family: sans-serif; max-width: 800px; margin: 40px auto; padding: 0 20px; background: #111; color: #eee; }
+    h1 { color: #e6522c; }
+    h2 { color: #f78764; border-bottom: 1px solid #333; padding-bottom: 6px; }
+    a { color: #f78764; }
+    code { background: #222; padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+    pre { background: #222; padding: 16px; border-radius: 6px; overflow-x: auto; }
+    .back { margin-bottom: 24px; }
+    .severity { display: inline-block; padding: 2px 10px; border-radius: 4px; font-size: 0.85em; background: #c0392b; }
+    .note { background: #1a2a1a; border-left: 3px solid #27ae60; padding: 10px 16px; border-radius: 4px; margin: 12px 0; }
+  </style>
+</head>
+<body>
+  <div class="back"><a href="index.html">← All Runbooks</a></div>
+  <h1>Under-Replicated Partitions</h1>
+  <span class="severity">CRITICAL</span>
+
+  <h2>What This Means</h2>
+  <p>One or more partitions have fewer in-sync replicas than their replication factor requires. This means data durability is degraded — if the remaining broker fails, data loss is possible.</p>
+
+  <div class="note">
+    <strong>Note:</strong> In this single-node dev setup, under-replication is expected since replication factor is 1. This alert is most relevant in multi-broker deployments.
+  </div>
+
+  <h2>Likely Causes</h2>
+  <ul>
+    <li>A broker node is down or unreachable</li>
+    <li>A follower is lagging too far behind to be in-sync</li>
+    <li>Network partition between broker nodes</li>
+    <li>A broker was restarted and is still catching up</li>
+  </ul>
+
+  <h2>Recommended Actions</h2>
+  <ol>
+    <li>Check cluster health: <pre>docker exec monitoring-redpanda-1 rpk cluster health</pre></li>
+    <li>List under-replicated partitions: <pre>docker exec monitoring-redpanda-1 rpk topic describe --print-partitions benchmark_64kb_0</pre></li>
+    <li>Check broker status: <pre>docker exec monitoring-redpanda-1 rpk cluster info</pre></li>
+    <li>If a broker recently restarted, wait for it to catch up — monitor <code>redpanda_kafka_under_replicated_replicas</code> trending back to 0.</li>
+    <li>If a broker is permanently lost in a 3-node cluster, trigger partition recovery: <pre>docker exec monitoring-redpanda-1 rpk cluster partitions move-cancel</pre></li>
+  </ol>
+
+  <h2>Metrics to Watch</h2>
+  <ul>
+    <li><code>redpanda_kafka_under_replicated_replicas</code> — count of under-replicated replicas (should be 0)</li>
+    <li><code>redpanda_cluster_unavailable_partitions</code> — partitions with no leader (more severe)</li>
+  </ul>
+</body>
+</html>

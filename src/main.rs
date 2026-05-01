@@ -2,13 +2,14 @@ use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub mod benchmark_proto {
     tonic::include_proto!("benchmark");
 }
 
-use rand::Rng;
+use rand::{Rng, SeedableRng};
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -18,10 +19,14 @@ use tokio::time::{interval, sleep, Instant};
 // ─── Message sizes ──────────────────────────────────────────────────────────
 
 const MESSAGE_SIZES: &[(u64, &str)] = &[
-    (65_536, "64kb"),
-    (1_048_576, "1mb"),
-    (12_582_912, "12mb"),
-    (33_554_432, "32mb"),
+    (24,          "24b"),
+    (256,         "256b"),
+    (4_096,       "4kb"),
+    (65_536,      "64kb"),
+    (524_288,     "512kb"),
+    (4_194_304,   "4mb"),
+    (16_777_216,  "16mb"),
+    (83_886_080,  "80mb"),
 ];
 
 const HEADER_LEN: usize = 24;
@@ -45,10 +50,22 @@ enum BrokerType {
 #[derive(Debug, Clone, PartialEq)]
 enum RunMode {
     Combined,
+    Only24b,
+    Only256b,
+    Only4kb,
     Only64kb,
-    Only1mb,
-    Only12mb,
-    Only32mb,
+    Only512kb,
+    Only4mb,
+    Only16mb,
+    Only80mb,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+enum PayloadType {
+    /// Correlated float32 values — realistic sensor/ADC data, compresses well with LZ4.
+    Float32,
+    /// Pure random bytes — max-entropy baseline, minimal LZ4 benefit.
+    RandomBytes,
 }
 
 #[derive(Debug, Clone)]
@@ -64,6 +81,19 @@ struct Config {
     run_id: String,
     output_dir: String,
     num_partitions: usize,
+    /// Number of parallel producer tasks. Defaults to num_partitions.
+    /// Use PRODUCER_TASKS to test "few vs many" producers independently.
+    num_producer_tasks: usize,
+    /// Number of parallel consumer instances. Defaults to num_partitions.
+    /// Each instance is assigned a slice of partitions via assign() (no group coordinator).
+    num_consumer_tasks: usize,
+    /// How often (seconds) to print real-time throughput to stderr.
+    report_interval_secs: u64,
+    /// Payload content type — float32 (realistic sensor data) or random_bytes (baseline).
+    payload_type: PayloadType,
+    /// Maximum messages per second per stream. Bandwidth is redistributed from
+    /// capped (small message) streams to uncapped (large message) streams.
+    max_msg_rate: u64,
 }
 
 fn env_var(key: &str, default: &str) -> String {
@@ -97,11 +127,15 @@ fn parse_config() -> Config {
         .expect("GBPS_TARGET must be a float");
 
     let run_mode = match env_var("RUN_MODE", "combined").to_lowercase().as_str() {
-        "64kb" => RunMode::Only64kb,
-        "1mb" => RunMode::Only1mb,
-        "12mb" => RunMode::Only12mb,
-        "32mb" => RunMode::Only32mb,
-        _ => RunMode::Combined,
+        "24b"   => RunMode::Only24b,
+        "256b"  => RunMode::Only256b,
+        "4kb"   => RunMode::Only4kb,
+        "64kb"  => RunMode::Only64kb,
+        "512kb" => RunMode::Only512kb,
+        "4mb"   => RunMode::Only4mb,
+        "16mb"  => RunMode::Only16mb,
+        "80mb"  => RunMode::Only80mb,
+        _       => RunMode::Combined,
     };
 
     let topic_prefix = env_var("TOPIC_PREFIX", "benchmark");
@@ -119,10 +153,34 @@ fn parse_config() -> Config {
         .to_string();
     let run_id = env_var("RUN_ID", &default_run_id);
     let output_dir = env_var("OUTPUT_DIR", ".");
-    let num_partitions: usize = env_var("PARTITIONS", "4")
+    let num_partitions: usize = env_var("PARTITIONS", "16")
         .parse()
         .expect("PARTITIONS must be a positive integer");
     let num_partitions = num_partitions.max(1);
+
+    let num_producer_tasks: usize = env_var("PRODUCER_TASKS", &num_partitions.to_string())
+        .parse()
+        .expect("PRODUCER_TASKS must be a positive integer");
+    let num_producer_tasks = num_producer_tasks.max(1);
+
+    let num_consumer_tasks: usize = env_var("CONSUMER_TASKS", &num_partitions.to_string())
+        .parse()
+        .expect("CONSUMER_TASKS must be a positive integer");
+    let num_consumer_tasks = num_consumer_tasks.max(1);
+
+    let report_interval_secs: u64 = env_var("REPORT_INTERVAL_SECS", "5")
+        .parse()
+        .expect("REPORT_INTERVAL_SECS must be u64");
+
+    let payload_type = match env_var("PAYLOAD_TYPE", "float32").to_lowercase().as_str() {
+        "random_bytes" | "random" => PayloadType::RandomBytes,
+        _ => PayloadType::Float32,
+    };
+
+    let max_msg_rate: u64 = env_var("MAX_MSG_RATE", "100")
+        .parse()
+        .expect("MAX_MSG_RATE must be a positive integer");
+    let max_msg_rate = max_msg_rate.max(1);
 
     Config {
         role,
@@ -136,23 +194,95 @@ fn parse_config() -> Config {
         run_id,
         output_dir,
         num_partitions,
+        num_producer_tasks,
+        num_consumer_tasks,
+        report_interval_secs,
+        payload_type,
+        max_msg_rate,
     }
 }
 
 // ─── Active streams ───────────────────────────────────────────────────────────
 
-/// Returns (size_bytes, size_label, fraction_of_gbps_target) for each active stream.
-fn active_streams(mode: &RunMode) -> Vec<(u64, &'static str, f64)> {
-    match mode {
-        RunMode::Combined => MESSAGE_SIZES
-            .iter()
-            .map(|(size, label)| (*size, *label, 0.25))
-            .collect(),
-        RunMode::Only64kb => vec![(65_536, "64kb", 1.0)],
-        RunMode::Only1mb => vec![(1_048_576, "1mb", 1.0)],
-        RunMode::Only12mb => vec![(12_582_912, "12mb", 1.0)],
-        RunMode::Only32mb => vec![(33_554_432, "32mb", 1.0)],
+/// Water-filling bandwidth allocation subject to a per-stream message rate cap.
+///
+/// Streams that would require more than `max_msg_rate` msg/s get capped; their
+/// unused bandwidth is redistributed to uncapped (larger) streams. This ensures
+/// small-message streams are tested at realistic rates while large-message streams
+/// absorb the remaining bandwidth budget.
+///
+/// Returns msg/s for each stream in the same order as `sizes`.
+fn water_fill_rates(sizes: &[u64], bytes_per_sec_total: f64, max_msg_rate: f64) -> Vec<f64> {
+    let n = sizes.len();
+    let mut rates = vec![0.0f64; n];
+    let mut capped = vec![false; n];
+    let mut remaining_bps = bytes_per_sec_total;
+    let mut uncapped_count = n;
+
+    loop {
+        if uncapped_count == 0 {
+            break;
+        }
+        let bps_each = remaining_bps / uncapped_count as f64;
+        let mut any_newly_capped = false;
+
+        for i in 0..n {
+            if capped[i] {
+                continue;
+            }
+            let msg_s = bps_each / sizes[i] as f64;
+            if msg_s > max_msg_rate {
+                rates[i] = max_msg_rate;
+                capped[i] = true;
+                remaining_bps -= max_msg_rate * sizes[i] as f64;
+                uncapped_count -= 1;
+                any_newly_capped = true;
+            }
+        }
+
+        if !any_newly_capped {
+            // All remaining streams fit within the cap — assign equal share
+            for i in 0..n {
+                if !capped[i] {
+                    rates[i] = bps_each / sizes[i] as f64;
+                }
+            }
+            break;
+        }
     }
+
+    rates
+}
+
+/// Returns (size_bytes, size_label, fraction_of_gbps_target) for each active stream.
+///
+/// `fraction` is derived from the water-filled allocation so downstream rate math
+/// stays unchanged: `msgs_per_sec = bytes_per_sec * fraction / size_bytes`.
+fn active_streams(mode: &RunMode, gbps_target: f64, max_msg_rate: u64) -> Vec<(u64, &'static str, f64)> {
+    let sizes: &[(u64, &str)] = match mode {
+        RunMode::Combined => MESSAGE_SIZES,
+        RunMode::Only24b   => &[(24,         "24b")],
+        RunMode::Only256b  => &[(256,        "256b")],
+        RunMode::Only4kb   => &[(4_096,      "4kb")],
+        RunMode::Only64kb  => &[(65_536,     "64kb")],
+        RunMode::Only512kb => &[(524_288,    "512kb")],
+        RunMode::Only4mb   => &[(4_194_304,  "4mb")],
+        RunMode::Only16mb  => &[(16_777_216, "16mb")],
+        RunMode::Only80mb  => &[(83_886_080, "80mb")],
+    };
+
+    let bytes_per_sec_total = gbps_target * 1_000_000_000.0 / 8.0;
+    let size_bytes: Vec<u64> = sizes.iter().map(|(s, _)| *s).collect();
+    let rates = water_fill_rates(&size_bytes, bytes_per_sec_total, max_msg_rate as f64);
+
+    sizes.iter().zip(rates.iter()).map(|((size, label), &rate)| {
+        let fraction = if bytes_per_sec_total > 0.0 {
+            (rate * *size as f64) / bytes_per_sec_total
+        } else {
+            0.0
+        };
+        (*size, *label, fraction)
+    }).collect()
 }
 
 // ─── Topic naming ─────────────────────────────────────────────────────────────
@@ -169,10 +299,15 @@ fn stream_name_from_topic(topic: &str) -> String {
 // ─── Message encode / decode ─────────────────────────────────────────────────
 
 fn encode_message(buf: &mut Vec<u8>, producer_ts_ns: u64, seq: u64, stream_id: u64) {
+    if buf.len() < HEADER_LEN {
+        // Message too small for the full tracking header — skip.
+        // These messages will be counted as received but won't contribute to
+        // latency or loss stats (decode_header returns None for short buffers).
+        return;
+    }
     buf[0..8].copy_from_slice(&producer_ts_ns.to_be_bytes());
     buf[8..16].copy_from_slice(&seq.to_be_bytes());
     buf[16..24].copy_from_slice(&stream_id.to_be_bytes());
-    // remainder is zero-padding (already zeroed from allocation)
 }
 
 fn decode_header(data: &[u8]) -> Option<(u64, u64, u64)> {
@@ -379,16 +514,67 @@ fn broker_type_str(bt: &BrokerType) -> &'static str {
 
 fn run_mode_str(rm: &RunMode) -> &'static str {
     match rm {
-        RunMode::Combined => "combined",
-        RunMode::Only64kb => "64kb",
-        RunMode::Only1mb => "1mb",
-        RunMode::Only12mb => "12mb",
-        RunMode::Only32mb => "32mb",
+        RunMode::Combined  => "combined",
+        RunMode::Only24b   => "24b",
+        RunMode::Only256b  => "256b",
+        RunMode::Only4kb   => "4kb",
+        RunMode::Only64kb  => "64kb",
+        RunMode::Only512kb => "512kb",
+        RunMode::Only4mb   => "4mb",
+        RunMode::Only16mb  => "16mb",
+        RunMode::Only80mb  => "80mb",
     }
 }
 
 fn us_to_ms(us: u64) -> f64 {
     us as f64 / 1000.0
+}
+
+// ─── Payload generation ───────────────────────────────────────────────────────
+
+/// Fill buf[HEADER_LEN..] with correlated float32 values that simulate sensor data.
+/// Adjacent samples share a common base value with small per-sample noise, giving
+/// LZ4 meaningful compressibility (like real ADC/radar output).
+fn fill_float32_payload(buf: &mut [u8], rng: &mut rand::rngs::SmallRng) {
+    let base: f32 = rng.gen_range(-1000.0_f32..1000.0_f32);
+    let noise_scale: f32 = rng.gen_range(0.1_f32..2.0_f32);
+    let mut offset = HEADER_LEN;
+    while offset + 4 <= buf.len() {
+        let val: f32 = base + noise_scale * rng.gen_range(-1.0_f32..1.0_f32);
+        buf[offset..offset + 4].copy_from_slice(&val.to_le_bytes());
+        offset += 4;
+    }
+}
+
+// ─── Real-time throughput reporter ───────────────────────────────────────────
+
+async fn run_throughput_reporter(
+    role: &str,
+    bytes_counter: Arc<AtomicU64>,
+    report_interval_secs: u64,
+    run_deadline: tokio::time::Instant,
+) {
+    if report_interval_secs == 0 {
+        return;
+    }
+    let mut ticker = interval(Duration::from_secs(report_interval_secs));
+    let mut last_bytes: u64 = 0;
+    let mut last_t = tokio::time::Instant::now();
+    loop {
+        ticker.tick().await;
+        if tokio::time::Instant::now() >= run_deadline {
+            break;
+        }
+        let now_bytes = bytes_counter.load(Ordering::Relaxed);
+        let elapsed = last_t.elapsed().as_secs_f64();
+        if elapsed > 0.0 {
+            let gbps = ((now_bytes - last_bytes) as f64 * 8.0) / (elapsed * 1_000_000_000.0);
+            let mb = (now_bytes - last_bytes) / 1_048_576;
+            eprintln!("[{}] {:.3} Gbps ({} MB in {:.1}s)", role, gbps, mb, elapsed);
+        }
+        last_bytes = now_bytes;
+        last_t = tokio::time::Instant::now();
+    }
 }
 
 // ─── NATS implementation ──────────────────────────────────────────────────────
@@ -397,7 +583,7 @@ async fn nats_producer(cfg: Config) {
     sleep(Duration::from_secs(cfg.producer_start_delay_secs)).await;
     eprintln!("[producer] connecting to NATS at {}", cfg.broker_endpoint);
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let bytes_per_sec = cfg.gbps_target * 1_000_000_000.0 / 8.0;
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
@@ -474,7 +660,7 @@ async fn nats_producer(cfg: Config) {
 async fn nats_consumer(cfg: Config) {
     eprintln!("[consumer] connecting to NATS at {}", cfg.broker_endpoint);
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
     // One task per stream, each with its own TCP connection so streams receive in parallel.
@@ -549,7 +735,8 @@ async fn rdkafka_ensure_topics(broker: &str, topics: &[String], num_partitions: 
         .iter()
         .map(|t| {
             NewTopic::new(t, num_partitions as i32, TopicReplication::Fixed(1))
-                .set("max.message.bytes", "67108864")
+                .set("max.message.bytes", "104857600") // 100 MB (covers 80 MB payload)
+                .set("compression.type", "lz4")
         })
         .collect();
 
@@ -575,11 +762,11 @@ async fn redpanda_producer(cfg: Config) {
 
     sleep(Duration::from_secs(cfg.producer_start_delay_secs)).await;
     eprintln!(
-        "[producer] connecting to Redpanda at {}",
-        cfg.broker_endpoint
+        "[producer] connecting to Redpanda at {} ({} producer tasks, {} partitions, payload={:?})",
+        cfg.broker_endpoint, cfg.num_producer_tasks, cfg.num_partitions, cfg.payload_type
     );
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let topics: Vec<String> = streams
         .iter()
         .map(|(_, label, _)| topic_name(&cfg.topic_prefix, label, 0))
@@ -589,55 +776,74 @@ async fn redpanda_producer(cfg: Config) {
 
     let producer: FutureProducer = ClientConfig::new()
         .set("bootstrap.servers", &cfg.broker_endpoint)
-        .set("message.max.bytes", "33600000")
+        .set("message.max.bytes", "104857600")         // 100 MB max message (covers 80 MB payload)
         .set("queue.buffering.max.messages", "1000000")
         .set("queue.buffering.max.kbytes", "4194304")  // 4 GB buffer
-        .set("queue.buffering.max.ms", "10")
+        .set("queue.buffering.max.ms", "50")           // linger 50ms for larger batches
         .set("batch.num.messages", "100000")
-        .set("batch.size", "104857600")  // 100 MB batches to match broker
+        .set("batch.size", "104857600")                // 100 MB batch
+        .set("compression.type", "lz4")
+        .set("socket.send.buffer.bytes", "67108864")
+        .set("socket.receive.buffer.bytes", "67108864")
         .create()
         .expect("Kafka producer creation failed");
 
     let bytes_per_sec = cfg.gbps_target * 1_000_000_000.0 / 8.0;
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
+    // Real-time throughput reporter
+    let bytes_counter = Arc::new(AtomicU64::new(0));
+    {
+        let counter = bytes_counter.clone();
+        let interval_secs = cfg.report_interval_secs;
+        tokio::spawn(async move {
+            run_throughput_reporter("producer", counter, interval_secs, run_deadline).await;
+        });
+    }
+
+    let payload_type = cfg.payload_type.clone();
     let mut handles: Vec<(u64, &'static str, tokio::task::JoinHandle<u64>)> = Vec::new();
     for (size_bytes, size_label, fraction) in &streams {
         let topic = topic_name(&cfg.topic_prefix, size_label, 0);
         let base_stream_id = *size_bytes;
-        // Split rate evenly across partitions
-        let msgs_per_sec = (bytes_per_sec * fraction) / (*size_bytes as f64 * cfg.num_partitions as f64);
+
+        // Rate split evenly across producer tasks (not partitions — tasks control throughput)
+        let msgs_per_sec = (bytes_per_sec * fraction) / (*size_bytes as f64 * cfg.num_producer_tasks as f64);
         let rate = compute_rate_params(msgs_per_sec);
 
-        // Limit in-flight per partition to ~100ms of pipeline depth.
-        // Generous enough to keep the pipeline full across linger+ack time,
-        // tight enough to bound queue buildup and latency.
+        // Limit in-flight per task to ~100ms of pipeline depth
         let max_in_flight = {
-            let bytes_in_flight = bytes_per_sec * fraction * 0.100 / cfg.num_partitions as f64;
+            let bytes_in_flight = bytes_per_sec * fraction * 0.100 / cfg.num_producer_tasks as f64;
             ((bytes_in_flight / *size_bytes as f64).ceil() as usize).max(4)
         };
 
         eprintln!(
-            "[producer] topic {} x{} partitions -> {:.1} msg/s/partition (batch={}, interval={}ms, max_in_flight={})",
-            topic, cfg.num_partitions, msgs_per_sec, rate.batch_size, rate.interval_ms, max_in_flight
+            "[producer] topic {} x{} tasks (x{} partitions) -> {:.1} msg/s/task (batch={}, interval={}ms, max_in_flight={})",
+            topic, cfg.num_producer_tasks, cfg.num_partitions, msgs_per_sec, rate.batch_size, rate.interval_ms, max_in_flight
         );
 
-        for p in 0..cfg.num_partitions {
-            // Unique stream_id per partition so the consumer's loss detector
-            // tracks each partition's sequence space independently.
-            let stream_id = base_stream_id * 1000 + p as u64;
+        for task_id in 0..cfg.num_producer_tasks {
+            // Round-robin across partitions; unique stream_id per task for loss tracking
+            let partition = (task_id % cfg.num_partitions) as i32;
+            let stream_id = base_stream_id * 1000 + task_id as u64;
             let semaphore = Arc::new(tokio::sync::Semaphore::new(max_in_flight));
             let producer2 = producer.clone();
             let topic2 = topic.clone();
             let size_bytes = *size_bytes;
             let size_label = *size_label;
+            let counter = bytes_counter.clone();
+            let payload_type2 = payload_type.clone();
 
             let handle = tokio::spawn(async move {
+                let mut rng = rand::rngs::SmallRng::from_entropy();
                 let mut buf = vec![0u8; size_bytes as usize];
-                { let mut rng = rand::thread_rng(); rng.fill(&mut buf[HEADER_LEN..]); }
+                match payload_type2 {
+                    PayloadType::Float32 => fill_float32_payload(&mut buf, &mut rng),
+                    PayloadType::RandomBytes => rng.fill(&mut buf[HEADER_LEN..]),
+                }
                 let mut seq: u64 = 0;
                 let mut ticker = interval(Duration::from_millis(rate.interval_ms));
-                let key = format!("{}-{}", stream_id, p);
+                let key = format!("{}-{}", stream_id, task_id);
 
                 loop {
                     if Instant::now() >= run_deadline {
@@ -652,38 +858,52 @@ async fn redpanda_producer(cfg: Config) {
                         let permit = semaphore.clone().acquire_owned().await.unwrap();
                         let ts = now_ns();
                         encode_message(&mut buf, ts, seq, stream_id);
-                        let record = FutureRecord::to(&topic2)
-                            .key(key.as_str())
-                            .partition(p as i32)
-                            .payload(&buf[..]);
                         let topic_clone = topic2.clone();
-                        match producer2.send_result(record) {
-                            Ok(future) => {
-                                tokio::spawn(async move {
-                                    match future.await {
-                                        Ok(Ok(_)) => {}
-                                        Ok(Err((e, _))) => eprintln!("[producer] delivery error on {}: {}", topic_clone, e),
-                                        Err(_) => eprintln!("[producer] delivery canceled on {}", topic_clone),
+                        let bytes_sent = size_bytes;
+                        let counter2 = counter.clone();
+                        // Retry on QueueFull so the producer naturally backs off
+                        // when the broker can't keep up, rather than dropping messages.
+                        let future = loop {
+                            let r = FutureRecord::to(&topic2)
+                                .key(key.as_str())
+                                .partition(partition)
+                                .payload(&buf[..]);
+                            match producer2.send_result(r) {
+                                Ok(f) => break Some(f),
+                                Err((e, _)) if e.to_string().contains("QueueFull") => {
+                                    sleep(Duration::from_millis(10)).await;
+                                }
+                                Err((e, _)) => {
+                                    eprintln!("[producer] enqueue error on {}: {}", topic2, e);
+                                    break None;
+                                }
+                            }
+                        };
+                        if let Some(future) = future {
+                            tokio::spawn(async move {
+                                match future.await {
+                                    Ok(Ok(_)) => {
+                                        counter2.fetch_add(bytes_sent, Ordering::Relaxed);
                                     }
-                                    drop(permit);
-                                });
-                            }
-                            Err((e, _)) => {
-                                eprintln!("[producer] enqueue error on {}: {}", topic2, e);
+                                    Ok(Err((e, _))) => eprintln!("[producer] delivery error on {}: {}", topic_clone, e),
+                                    Err(_) => eprintln!("[producer] delivery canceled on {}", topic_clone),
+                                }
                                 drop(permit);
-                            }
+                            });
+                        } else {
+                            drop(permit);
                         }
                         seq += 1;
                     }
                 }
-                eprintln!("[producer] {}/partition-{} done, sent {} messages", topic2, p, seq);
+                eprintln!("[producer] {}/task-{} done, sent {} messages", topic2, task_id, seq);
                 seq
             });
             handles.push((size_bytes, size_label, handle));
         }
     }
 
-    // Aggregate sent counts across partitions per stream size
+    // Aggregate sent counts per stream size
     let mut sent_map: HashMap<(u64, &'static str), u64> = HashMap::new();
     for (size_bytes, size_label, h) in handles {
         let sent = h.await.unwrap_or(0);
@@ -699,15 +919,16 @@ async fn redpanda_producer(cfg: Config) {
 }
 
 async fn redpanda_consumer(cfg: Config) {
-    use rdkafka::consumer::{CommitMode, Consumer, StreamConsumer};
+    use rdkafka::consumer::{Consumer, StreamConsumer};
+    use rdkafka::topic_partition_list::{Offset, TopicPartitionList};
     use rdkafka::ClientConfig;
 
     eprintln!(
-        "[consumer] connecting to Redpanda at {}",
-        cfg.broker_endpoint
+        "[consumer] connecting to Redpanda at {} ({} consumer tasks, {} partitions)",
+        cfg.broker_endpoint, cfg.num_consumer_tasks, cfg.num_partitions
     );
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let topics: Vec<String> = streams
         .iter()
         .map(|(_, label, _)| topic_name(&cfg.topic_prefix, label, 0))
@@ -716,50 +937,236 @@ async fn redpanda_consumer(cfg: Config) {
     rdkafka_ensure_topics(&cfg.broker_endpoint, &topics, cfg.num_partitions).await;
     sleep(Duration::from_millis(500)).await;
 
-    let consumer: StreamConsumer = ClientConfig::new()
-        .set("bootstrap.servers", &cfg.broker_endpoint)
-        .set("group.id", &format!("broker-benchmarker-{}", cfg.run_id))
-        .set("auto.offset.reset", "latest")
-        .set("enable.auto.commit", "false")
-        .set("fetch.message.max.bytes", "33600000")
-        .set("fetch.max.bytes", "52428800")
-        .set("receive.message.max.bytes", "67108864")
-        .create()
-        .expect("Kafka consumer creation failed");
-
-    let topic_strs: Vec<&str> = topics.iter().map(|s| s.as_str()).collect();
-    consumer
-        .subscribe(&topic_strs)
-        .expect("subscription failed");
-
-    let mut stats_map: HashMap<String, StreamStats> = HashMap::new();
-    for topic in &topics {
-        stats_map.insert(topic.clone(), StreamStats::new());
-    }
-
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
-    let mut stream = consumer.stream();
-    while Instant::now() < run_deadline {
-        match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
-            Ok(Some(Ok(msg))) => {
-                use rdkafka::Message;
-                let recv_ns = now_ns();
-                let topic = msg.topic().to_string();
-                if let Some(payload) = msg.payload() {
-                    if let Some(stats) = stats_map.get_mut(&topic) {
-                        stats.record(payload, recv_ns);
-                    }
-                }
-                let _ = consumer.commit_message(&msg, CommitMode::Async);
+    // Real-time throughput reporter
+    let bytes_counter = Arc::new(AtomicU64::new(0));
+    {
+        let counter = bytes_counter.clone();
+        let interval_secs = cfg.report_interval_secs;
+        tokio::spawn(async move {
+            run_throughput_reporter("consumer", counter, interval_secs, run_deadline).await;
+        });
+    }
+
+    // Spawn one consumer task per CONSUMER_TASKS, each owning a slice of partitions.
+    // Using assign() instead of subscribe() bypasses the group coordinator entirely —
+    // no rebalance delays, no group protocol overhead, linear throughput scaling.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<HashMap<String, StreamStats>>(cfg.num_consumer_tasks + 1);
+
+    for task_i in 0..cfg.num_consumer_tasks {
+        // Interleave partition assignment: task 0 gets 0,4,8,...  task 1 gets 1,5,9,...
+        let assigned_partitions: Vec<i32> = (0..cfg.num_partitions as i32)
+            .filter(|&p| (p as usize) % cfg.num_consumer_tasks == task_i)
+            .collect();
+
+        let consumer: StreamConsumer = ClientConfig::new()
+            .set("bootstrap.servers", &cfg.broker_endpoint)
+            // group.id is required by rdkafka even with assign() — not used for coordination
+            .set("group.id", &format!("bench-{}-{}", cfg.run_id, task_i))
+            .set("auto.offset.reset", "latest")
+            .set("enable.auto.commit", "false")
+            .set("fetch.message.max.bytes", "104857600")   // 100 MB per message (handles 80 MB)
+            .set("fetch.max.bytes", "209715200")            // 200 MB total per poll
+            .set("receive.message.max.bytes", "268435456") // must be > fetch.max.bytes + 512
+            .set("fetch.wait.max.ms", "5")
+            .set("socket.receive.buffer.bytes", "67108864")
+            .create()
+            .expect("Kafka consumer creation failed");
+
+        // Assign specific partitions — skips group coordinator entirely
+        let mut tpl = TopicPartitionList::new();
+        for topic in &topics {
+            for &p in &assigned_partitions {
+                tpl.add_partition_offset(topic, p, Offset::End)
+                    .expect("add_partition_offset failed");
             }
-            Ok(Some(Err(e))) => eprintln!("[consumer] kafka error: {}", e),
-            Ok(None) => break,
-            Err(_) => {} // timeout
+        }
+        consumer.assign(&tpl).expect("consumer assign failed");
+
+        let topics_clone = topics.clone();
+        let tx_clone = tx.clone();
+        let counter = bytes_counter.clone();
+
+        tokio::spawn(async move {
+            let mut local_stats: HashMap<String, StreamStats> = topics_clone
+                .iter()
+                .map(|t| (t.clone(), StreamStats::new()))
+                .collect();
+
+            let mut stream = consumer.stream();
+            while tokio::time::Instant::now() < run_deadline {
+                match tokio::time::timeout(Duration::from_millis(200), stream.next()).await {
+                    Ok(Some(Ok(msg))) => {
+                        use rdkafka::Message;
+                        let recv_ns = now_ns();
+                        let topic = msg.topic().to_string();
+                        if let Some(payload) = msg.payload() {
+                            counter.fetch_add(payload.len() as u64, Ordering::Relaxed);
+                            if let Some(stats) = local_stats.get_mut(&topic) {
+                                stats.record(payload, recv_ns);
+                            }
+                        }
+                    }
+                    Ok(Some(Err(e))) => eprintln!("[consumer] task {} kafka error: {}", task_i, e),
+                    Ok(None) => break,
+                    Err(_) => {} // timeout
+                }
+            }
+
+            let total: u64 = local_stats.values().map(|s| s.messages_received).sum();
+            eprintln!("[consumer] task {} done, received {} messages", task_i, total);
+            let _ = tx_clone.send(local_stats).await;
+        });
+    }
+    drop(tx); // close the sender side so rx.recv() eventually returns None
+
+    // Aggregate stats from all consumer tasks
+    let mut stats_map: HashMap<String, StreamStats> = topics
+        .iter()
+        .map(|t| (t.clone(), StreamStats::new()))
+        .collect();
+    while let Some(local) = rx.recv().await {
+        for (topic, stats) in local {
+            stats_map
+                .entry(topic)
+                .or_insert_with(StreamStats::new)
+                .merge(&stats);
         }
     }
 
     emit_consumer_csv(&cfg, &stats_map, &streams);
+}
+
+// ─── Benchmark report ─────────────────────────────────────────────────────────
+
+struct ReportRow {
+    size_label: String,
+    size_bytes: u64,
+    achieved_gbps: f64,
+    messages_received: u64,
+    messages_lost: u64,
+    p50_ms: f64,
+    p95_ms: f64,
+    p99_ms: f64,
+    max_ms: f64,
+}
+
+fn emit_benchmark_report(cfg: &Config, rows: &[ReportRow]) {
+    let path = format!(
+        "{}/report_{}.md",
+        cfg.output_dir, cfg.run_id
+    );
+    let mut f = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+        .unwrap_or_else(|e| panic!("failed to open {}: {}", path, e));
+
+    // ── Hardware ──────────────────────────────────────────────────────────────
+    let cpu_count = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(0);
+
+    let total_ram_gb = {
+        use sysinfo::System;
+        let mut sys = System::new();
+        sys.refresh_memory();
+        sys.total_memory() / 1_073_741_824
+    };
+
+    let in_container = std::path::Path::new("/.dockerenv").exists();
+    let os = std::env::consts::OS;
+
+    writeln!(f, "# Broker Benchmark Report").unwrap();
+    writeln!(f, "\n## Hardware").unwrap();
+    writeln!(f, "| Property | Value |").unwrap();
+    writeln!(f, "|---|---|").unwrap();
+    writeln!(f, "| OS | {} |", os).unwrap();
+    writeln!(f, "| Logical CPU cores | {} |", cpu_count).unwrap();
+    writeln!(f, "| Total RAM | {} GB |", total_ram_gb).unwrap();
+    writeln!(f, "| Container | {} |", if in_container { "yes (Docker)" } else { "no" }).unwrap();
+
+    // ── Setup ─────────────────────────────────────────────────────────────────
+    let payload_label = match cfg.payload_type {
+        PayloadType::Float32 => "float32 correlated (LZ4-compressible)",
+        PayloadType::RandomBytes => "random bytes (entropy baseline)",
+    };
+
+    writeln!(f, "\n## Test Setup").unwrap();
+    writeln!(f, "| Parameter | Value |").unwrap();
+    writeln!(f, "|---|---|").unwrap();
+    writeln!(f, "| Broker | {:?} @ {} |", cfg.broker_type, cfg.broker_endpoint).unwrap();
+    writeln!(f, "| Run mode | {} |", run_mode_str(&cfg.run_mode)).unwrap();
+    writeln!(f, "| GBPS target | {:.1} |", cfg.gbps_target).unwrap();
+    writeln!(f, "| Duration | {}s |", cfg.run_duration_secs).unwrap();
+    writeln!(f, "| Partitions | {} |", cfg.num_partitions).unwrap();
+    writeln!(f, "| Producer tasks | {} |", cfg.num_producer_tasks).unwrap();
+    writeln!(f, "| Consumer tasks | {} |", cfg.num_consumer_tasks).unwrap();
+    writeln!(f, "| Payload type | {} |", payload_label).unwrap();
+    writeln!(f, "| Max msg rate | {} msg/s/stream |", cfg.max_msg_rate).unwrap();
+    writeln!(f, "| Compression | LZ4 |").unwrap();
+    writeln!(f, "| Run ID | {} |", cfg.run_id).unwrap();
+
+    // ── Results ───────────────────────────────────────────────────────────────
+    writeln!(f, "\n## Results").unwrap();
+    writeln!(f, "| Message Size | Target Gbps | Achieved Gbps | Efficiency | Messages | Lost | p50 ms | p95 ms | p99 ms | max ms |").unwrap();
+    writeln!(f, "|---|---|---|---|---|---|---|---|---|---|").unwrap();
+
+    for row in rows {
+        let efficiency = if cfg.gbps_target > 0.0 {
+            (row.achieved_gbps / (cfg.gbps_target * 0.25)) * 100.0  // 0.25 for combined 25% each
+        } else {
+            0.0
+        };
+        let target_per_stream = if matches!(cfg.run_mode, RunMode::Combined) {
+            cfg.gbps_target * 0.25
+        } else {
+            cfg.gbps_target
+        };
+        let eff_pct = if target_per_stream > 0.0 {
+            (row.achieved_gbps / target_per_stream * 100.0) as u64
+        } else {
+            0
+        };
+        let _ = efficiency;
+        writeln!(
+            f,
+            "| {} | {:.2} | {:.3} | {}% | {} | {} | {:.1} | {:.1} | {:.1} | {:.1} |",
+            row.size_label,
+            target_per_stream,
+            row.achieved_gbps,
+            eff_pct,
+            row.messages_received,
+            row.messages_lost,
+            row.p50_ms,
+            row.p95_ms,
+            row.p99_ms,
+            row.max_ms,
+        ).unwrap();
+    }
+
+    // ── Summary totals ────────────────────────────────────────────────────────
+    let total_achieved: f64 = rows.iter().map(|r| r.achieved_gbps).sum();
+    let total_messages: u64 = rows.iter().map(|r| r.messages_received).sum();
+    let total_lost: u64 = rows.iter().map(|r| r.messages_lost).sum();
+    let overall_eff = if cfg.gbps_target > 0.0 {
+        (total_achieved / cfg.gbps_target * 100.0) as u64
+    } else {
+        0
+    };
+
+    writeln!(f, "\n## Summary").unwrap();
+    writeln!(f, "| Metric | Value |").unwrap();
+    writeln!(f, "|---|---|").unwrap();
+    writeln!(f, "| Target Gbps | {:.1} |", cfg.gbps_target).unwrap();
+    writeln!(f, "| Achieved Gbps | **{:.3}** |", total_achieved).unwrap();
+    writeln!(f, "| Efficiency | **{}%** |", overall_eff).unwrap();
+    writeln!(f, "| Messages received | {} |", total_messages).unwrap();
+    writeln!(f, "| Messages lost | **{}** |", total_lost).unwrap();
+
+    eprintln!("[report] written to {}", path);
 }
 
 // ─── CSV emission ─────────────────────────────────────────────────────────────
@@ -780,6 +1187,8 @@ fn emit_consumer_csv(
         BrokerType::Nats => 1,
         BrokerType::Redpanda | BrokerType::Kafka | BrokerType::Grpc => cfg.num_partitions,
     };
+
+    let mut report_rows: Vec<ReportRow> = Vec::new();
 
     for (size_bytes, size_label, _) in streams {
         // Aggregate stats across all partitions for this stream size
@@ -812,7 +1221,21 @@ fn emit_consumer_csv(
             p99,
             max,
         );
+
+        report_rows.push(ReportRow {
+            size_label: size_label.to_string(),
+            size_bytes: *size_bytes,
+            achieved_gbps: achieved,
+            messages_received: agg.messages_received,
+            messages_lost: agg.messages_lost,
+            p50_ms: p50,
+            p95_ms: p95,
+            p99_ms: p99,
+            max_ms: max,
+        });
     }
+
+    emit_benchmark_report(cfg, &report_rows);
 }
 
 fn emit_producer_csv(
@@ -852,7 +1275,7 @@ async fn grpc_consumer(cfg: Config) {
         cfg.broker_endpoint
     );
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
 
     // Shared stats map keyed by stream_id (size_bytes * 1000 + partition).
     let stats: Arc<Mutex<HashMap<u64, StreamStats>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -949,7 +1372,7 @@ async fn grpc_producer(cfg: Config) {
         .await
         .expect("gRPC connect failed");
 
-    let streams = active_streams(&cfg.run_mode);
+    let streams = active_streams(&cfg.run_mode, cfg.gbps_target, cfg.max_msg_rate);
     let bytes_per_sec = cfg.gbps_target * 1_000_000_000.0 / 8.0;
     let run_deadline = Instant::now() + Duration::from_secs(cfg.run_duration_secs);
 
@@ -1115,19 +1538,27 @@ mod tests {
 
     #[test]
     fn test_active_streams_combined() {
-        let s = active_streams(&RunMode::Combined);
-        assert_eq!(s.len(), 4);
+        // Combined mode should return all 8 message sizes
+        let s = active_streams(&RunMode::Combined, 10.0, 100);
+        assert_eq!(s.len(), 8);
+        // Fractions must sum to 1.0
+        let total: f64 = s.iter().map(|(_, _, f)| f).sum();
+        assert!((total - 1.0).abs() < 1e-6);
+        // All fractions must be positive
         for (_, _, frac) in &s {
-            assert!((frac - 0.25).abs() < 1e-9);
+            assert!(*frac > 0.0);
         }
     }
 
     #[test]
     fn test_active_streams_single() {
-        let s = active_streams(&RunMode::Only64kb);
+        // Single-size mode returns exactly one stream
+        let s = active_streams(&RunMode::Only64kb, 10.0, 100);
         assert_eq!(s.len(), 1);
         assert_eq!(s[0].0, 65_536);
-        assert!((s[0].2 - 1.0).abs() < 1e-9);
+        // Fraction must be positive and <= 1.0
+        assert!(s[0].2 > 0.0);
+        assert!(s[0].2 <= 1.0 + 1e-9);
     }
 
     #[test]

@@ -1,1 +1,4 @@
 target/release/*
+monitoring/*
+target/debug/
+results/*.csv

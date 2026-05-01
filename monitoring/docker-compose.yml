@@ -1,0 +1,116 @@
+version: '3.8'
+
+services:
+  redpanda:
+    image: redpandadata/redpanda:latest
+    command:
+      - redpanda
+      - start
+      - --smp=6                              # use 6 reactor cores (matches cpus limit)
+      - --memory=8G                          # was 1G
+      - --reserve-memory=0M
+      - --node-id=0
+      - --kafka-addr=PLAINTEXT://0.0.0.0:29092,OUTSIDE://0.0.0.0:9092
+      - --advertise-kafka-addr=PLAINTEXT://redpanda:29092,OUTSIDE://localhost:9092
+      - --pandaproxy-addr=0.0.0.0:8082
+      - --advertise-pandaproxy-addr=localhost:8082
+    ports:
+      - "9092:9092"
+      - "9644:9644"
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9644/v1/node_config"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '6'
+          memory: 10G
+
+  prometheus:
+    image: prom/prometheus:latest
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+    depends_on:
+      - redpanda
+
+  runbooks:
+    image: nginx:alpine
+    volumes:
+      - ./runbooks:/usr/share/nginx/html:ro
+    ports:
+      - "8090:80"
+
+  grafana:
+    image: grafana/grafana:main
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    depends_on:
+      - prometheus
+
+  # ── Benchmarker services ────────────────────────────────────────────────────
+  # Started with: docker compose --profile bench up --build bench-consumer bench-producer
+  # These run inside the Docker network so traffic never crosses the host↔VM boundary.
+  # BROKER_ENDPOINT uses the internal listener (redpanda:29092), not the host-forwarded port.
+
+  bench-consumer:
+    profiles: ["bench"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: broker-benchmarker:latest
+    environment:
+      - ROLE=consumer
+      - BROKER_TYPE=redpanda
+      - BROKER_ENDPOINT=redpanda:29092
+      - GBPS_TARGET=${GBPS_TARGET:-10}
+      - RUN_MODE=${RUN_MODE:-combined}
+      - RUN_DURATION_SECS=${RUN_DURATION_SECS:-60}
+      - PARTITIONS=${PARTITIONS:-16}
+      - CONSUMER_TASKS=${CONSUMER_TASKS:-16}
+      - PAYLOAD_TYPE=${PAYLOAD_TYPE:-float32}
+      - REPORT_INTERVAL_SECS=${REPORT_INTERVAL_SECS:-5}
+      - MAX_MSG_RATE=${MAX_MSG_RATE:-100}
+      - OUTPUT_DIR=/results
+    volumes:
+      - ../results:/results
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  bench-producer:
+    profiles: ["bench"]
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    image: broker-benchmarker:latest
+    environment:
+      - ROLE=producer
+      - BROKER_TYPE=redpanda
+      - BROKER_ENDPOINT=redpanda:29092
+      - GBPS_TARGET=${GBPS_TARGET:-10}
+      - RUN_MODE=${RUN_MODE:-combined}
+      - RUN_DURATION_SECS=${RUN_DURATION_SECS:-60}
+      - PARTITIONS=${PARTITIONS:-16}
+      - PRODUCER_TASKS=${PRODUCER_TASKS:-16}
+      - PAYLOAD_TYPE=${PAYLOAD_TYPE:-float32}
+      - REPORT_INTERVAL_SECS=${REPORT_INTERVAL_SECS:-5}
+      - PRODUCER_START_DELAY_SECS=${PRODUCER_START_DELAY_SECS:-5}
+      - MAX_MSG_RATE=${MAX_MSG_RATE:-100}
+      - OUTPUT_DIR=/results
+    volumes:
+      - ../results:/results
+    depends_on:
+      redpanda:
+        condition: service_healthy

@@ -1,0 +1,5 @@
+role,broker_type,run_mode,gbps_target,message_size_bytes,run_duration_secs,messages_sent,messages_received,messages_lost,achieved_throughput_gbps,latency_p50_ms,latency_p95_ms,latency_p99_ms,latency_max_ms
+producer,redpanda,combined,1.000,65536,300,150000,,,,,,,
+producer,redpanda,combined,1.000,1048576,300,8956,,,,,,,
+producer,redpanda,combined,1.000,12582912,300,748,,,,,,,
+producer,redpanda,combined,1.000,33554432,300,280,,,,,,,

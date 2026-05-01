@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: redpanda
+    orgId: 1
+    folder: Redpanda
+    type: file
+    disableDeletion: false
+    editable: true
+    options:
+      path: /var/lib/grafana/dashboards

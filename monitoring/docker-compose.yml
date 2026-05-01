@@ -81,6 +81,7 @@ services:
       - CONSUMER_TASKS=${CONSUMER_TASKS:-16}
       - PAYLOAD_TYPE=${PAYLOAD_TYPE:-float32}
       - REPORT_INTERVAL_SECS=${REPORT_INTERVAL_SECS:-5}
+      - MAX_MSG_RATE=${MAX_MSG_RATE:-100}
       - OUTPUT_DIR=/results
     volumes:
       - ../results:/results
@@ -106,6 +107,7 @@ services:
       - PAYLOAD_TYPE=${PAYLOAD_TYPE:-float32}
       - REPORT_INTERVAL_SECS=${REPORT_INTERVAL_SECS:-5}
       - PRODUCER_START_DELAY_SECS=${PRODUCER_START_DELAY_SECS:-5}
+      - MAX_MSG_RATE=${MAX_MSG_RATE:-100}
       - OUTPUT_DIR=/results
     volumes:
       - ../results:/results

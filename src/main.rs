@@ -1105,6 +1105,7 @@ fn emit_benchmark_report(cfg: &Config, rows: &[ReportRow]) {
     writeln!(f, "| Producer tasks | {} |", cfg.num_producer_tasks).unwrap();
     writeln!(f, "| Consumer tasks | {} |", cfg.num_consumer_tasks).unwrap();
     writeln!(f, "| Payload type | {} |", payload_label).unwrap();
+    writeln!(f, "| Max msg rate | {} msg/s/stream |", cfg.max_msg_rate).unwrap();
     writeln!(f, "| Compression | LZ4 |").unwrap();
     writeln!(f, "| Run ID | {} |", cfg.run_id).unwrap();
 

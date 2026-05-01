@@ -23,6 +23,7 @@ CONSUMER_TASKS="${CONSUMER_TASKS:-$PARTITIONS}"
 REPORT_INTERVAL_SECS="${REPORT_INTERVAL_SECS:-5}"
 PAYLOAD_TYPE="${PAYLOAD_TYPE:-float32}"
 PRODUCER_START_DELAY_SECS="${PRODUCER_START_DELAY_SECS:-5}"
+MAX_MSG_RATE="${MAX_MSG_RATE:-100}"
 OUTPUT_DIR="${OUTPUT_DIR:-.}"
 DOCKER_MODE=false
 
@@ -36,6 +37,7 @@ while [[ $# -gt 0 ]]; do
     --producer-tasks) PRODUCER_TASKS="$2";       shift 2 ;;
     --consumer-tasks) CONSUMER_TASKS="$2";       shift 2 ;;
     --payload)     PAYLOAD_TYPE="$2";            shift 2 ;;
+    --max-msg-rate) MAX_MSG_RATE="$2";           shift 2 ;;
     --endpoint)    BROKER_ENDPOINT="$2";         shift 2 ;;
     --output-dir)  OUTPUT_DIR="$2";              shift 2 ;;
     --docker)      DOCKER_MODE=true;             shift ;;
@@ -49,6 +51,7 @@ while [[ $# -gt 0 ]]; do
       echo "  --producer-tasks N  Producer task count              (default: PARTITIONS)"
       echo "  --consumer-tasks N  Consumer task count              (default: PARTITIONS)"
       echo "  --payload TYPE      float32|random_bytes             (default: float32)"
+      echo "  --max-msg-rate N    Max messages/sec per stream      (default: 100)"
       echo "  --endpoint HOST:PORT Broker address                  (default: localhost:9092)"
       echo "  --output-dir DIR    Where to write CSV + report      (default: .)"
       echo "  --docker            Run benchmarker inside Docker network (no host↔VM hop)"
@@ -69,6 +72,7 @@ echo "  Partitions     : $PARTITIONS"
 echo "  Producer tasks : $PRODUCER_TASKS"
 echo "  Consumer tasks : $CONSUMER_TASKS"
 echo "  Payload        : $PAYLOAD_TYPE"
+echo "  Max msg rate   : ${MAX_MSG_RATE} msg/s/stream"
 echo "  Output dir     : $OUTPUT_DIR"
 echo "=================================================="
 
@@ -83,7 +87,8 @@ if [[ "$DOCKER_MODE" == true ]]; then
 
   # Export vars so docker compose can read them as ${VAR} substitutions
   export GBPS_TARGET RUN_MODE RUN_DURATION_SECS PARTITIONS PRODUCER_TASKS \
-         CONSUMER_TASKS PAYLOAD_TYPE REPORT_INTERVAL_SECS PRODUCER_START_DELAY_SECS
+         CONSUMER_TASKS PAYLOAD_TYPE REPORT_INTERVAL_SECS PRODUCER_START_DELAY_SECS \
+         MAX_MSG_RATE
 
   cd "$SCRIPT_DIR/monitoring"
 
@@ -113,6 +118,7 @@ COMMON_ENV=(
   PARTITIONS="$PARTITIONS"
   REPORT_INTERVAL_SECS="$REPORT_INTERVAL_SECS"
   PAYLOAD_TYPE="$PAYLOAD_TYPE"
+  MAX_MSG_RATE="$MAX_MSG_RATE"
   OUTPUT_DIR="$OUTPUT_DIR"
 )
 
